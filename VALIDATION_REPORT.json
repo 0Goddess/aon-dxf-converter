@@ -1,0 +1,23 @@
+{
+  "application_version": "1.0.0",
+  "tested_input": "Microsoft Project XML supplied for the Hsinchu Hukou project",
+  "source_mode_test": "passed",
+  "packaged_runtime_test": "passed",
+  "result": {
+    "tasks": 553,
+    "links": 599,
+    "critical_tasks": 39,
+    "direct_links": 472,
+    "two_turn_links": 102,
+    "four_turn_links": 25,
+    "dxf_version": "AC1024 / R2010",
+    "dxf_audit_errors": 0,
+    "one_link_object_per_relationship": true,
+    "remaining_non_ascii_text_entities": 0
+  },
+  "notes": [
+    "The packaged-runtime test was executed in the available Linux build environment.",
+    "The included PyInstaller specification, Windows CMD builder, and GitHub Actions workflow target Windows x64.",
+    "A Windows executable must be built on a Windows runner; PyInstaller does not cross-compile Windows executables from Linux."
+  ]
+}

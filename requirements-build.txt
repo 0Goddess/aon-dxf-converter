@@ -1,0 +1,5 @@
+ezdxf==1.4.4
+fonttools==4.63.0
+numpy==2.5.1
+pyinstaller==6.16.0
+

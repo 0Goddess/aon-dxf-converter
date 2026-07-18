@@ -1,0 +1,14 @@
+Third-party notices
+===================
+
+This application is distributed with or built using the following projects:
+
+- ezdxf — MIT License
+- FontTools — MIT License
+- NumPy — BSD 3-Clause License
+- PyInstaller — GPL 2.0 with the PyInstaller bootloader exception
+- Noto Sans TC — SIL Open Font License 1.1
+
+The complete SIL Open Font License text for the bundled font is included at
+assets/OFL-1.1.txt in the source package and inside the packaged application.
+
