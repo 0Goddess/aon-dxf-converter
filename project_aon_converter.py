@@ -641,6 +641,7 @@ class DrawingLayout:
     min_y: float
     max_y: float
     time_axis: list[tuple[str, float]] = field(default_factory=list)
+    time_axis_title: str = ""
 
 
 def subset_graph(model: ProjectModel, zones: set[str] | None) -> tuple[dict[int, Task], list[Link], set[int]]:

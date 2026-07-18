@@ -4,13 +4,12 @@
 from __future__ import annotations
 
 import argparse
-import calendar
 import collections
 import json
 import math
 import sys
 import unicodedata
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 
 sys.path.insert(0, "/tmp/ezdxf_runtime")
@@ -38,11 +37,11 @@ LAYER_CONFIG = {
     "AON_WARNING": {"color": 30},
     "AON_BOUNDARY": {"color": 9, "linetype": "DASHED"},
     "AON_TEXT": {"color": 7},
-    "AON_LINK_FS": {"color": 8},
-    "AON_LINK_SS": {"color": 4},
-    "AON_LINK_FF": {"color": 3},
-    "AON_LINK_SF": {"color": 6},
-    "AON_LINK_CRITICAL": {"color": 1},
+    "AON_LINK_FS": {"color": 8, "true_color": 0x596673},
+    "AON_LINK_SS": {"color": 4, "true_color": 0x007A99},
+    "AON_LINK_FF": {"color": 3, "true_color": 0x087A4B},
+    "AON_LINK_SF": {"color": 6, "true_color": 0x77508F},
+    "AON_LINK_CRITICAL": {"color": 1, "true_color": 0xB80000},
 }
 
 
@@ -58,37 +57,75 @@ MIN_VERTICAL_CHANNEL_SPACING = 10.0
 MIN_HORIZONTAL_CHANNEL_SPACING = 6.0
 
 
-def dominant_month(task) -> tuple[int, int]:
-    """Choose the calendar month containing the largest share of the task."""
+TIME_SCALE_TITLES = {"week": "週", "month": "月", "quarter": "季", "year": "年"}
+
+
+def task_dates(task) -> tuple[date, date]:
     start_raw = task.early_start or task.start
     finish_raw = task.early_finish or task.finish or start_raw
     try:
         start = datetime.fromisoformat(start_raw).date()
         finish = datetime.fromisoformat(finish_raw).date()
     except (TypeError, ValueError):
-        return (1970, 1)
+        return date(1970, 1, 1), date(1970, 1, 1)
     if finish < start:
         start, finish = finish, start
-    best = (start.year, start.month)
-    best_days = -1
-    year, month = start.year, start.month
-    while (year, month) <= (finish.year, finish.month):
-        month_start = datetime(year, month, 1).date()
-        month_end = datetime(year, month, calendar.monthrange(year, month)[1]).date()
-        overlap = (min(finish, month_end) - max(start, month_start)).days + 1
-        if overlap > best_days:
-            best, best_days = (year, month), overlap
-        month = month + 1
-        if month == 13:
-            year, month = year + 1, 1
-    return best
+    return start, finish
 
 
-def enlarge_layout(layout: DrawingLayout) -> DrawingLayout:
-    """Lay out tasks by dominant month and align compatible FS chains."""
-    task_month = {uid: dominant_month(node.task) for uid, node in layout.nodes.items()}
-    months = sorted(set(task_month.values()))
-    month_index = {month: index for index, month in enumerate(months)}
+def period_key(value: date, scale: str) -> tuple[int, ...]:
+    if scale == "week":
+        iso = value.isocalendar()
+        return iso.year, iso.week
+    if scale == "quarter":
+        return value.year, (value.month - 1) // 3 + 1
+    if scale == "year":
+        return (value.year,)
+    return value.year, value.month
+
+
+def dominant_period(task, scale: str) -> tuple[int, ...]:
+    start, finish = task_dates(task)
+    counts: collections.Counter[tuple[int, ...]] = collections.Counter()
+    for ordinal in range(start.toordinal(), finish.toordinal() + 1):
+        counts[period_key(date.fromordinal(ordinal), scale)] += 1
+    return min(counts, key=lambda key: (-counts[key], key))
+
+
+def period_label(key: tuple[int, ...], scale: str) -> str:
+    if scale == "week":
+        return f"{key[0]:04d}-W{key[1]:02d}"
+    if scale == "quarter":
+        return f"{key[0]:04d}-Q{key[1]}"
+    if scale == "year":
+        return f"{key[0]:04d}"
+    return f"{key[0]:04d}-{key[1]:02d}"
+
+
+def resolve_time_scale(layout: DrawingLayout, requested: str) -> str:
+    if requested != "auto":
+        return requested
+    starts, finishes = zip(*(task_dates(node.task) for node in layout.nodes.values()))
+    span_days = (max(finishes) - min(starts)).days + 1
+    if span_days <= 120:
+        return "week"
+    if span_days <= 1460:
+        return "month"
+    if span_days <= 3650:
+        return "quarter"
+    return "year"
+
+
+def enlarge_layout(layout: DrawingLayout, time_scale: str = "month") -> DrawingLayout:
+    """Lay out tasks by a user-selectable dominant time period."""
+    scale = resolve_time_scale(layout, time_scale)
+    task_period = (
+        {uid: (node.task.rank,) for uid, node in layout.nodes.items()}
+        if scale == "none"
+        else {uid: dominant_period(node.task, scale) for uid, node in layout.nodes.items()}
+    )
+    periods = sorted(set(task_period.values()))
+    period_index = {period: index for index, period in enumerate(periods)}
     zone_order = sorted(
         {node.task.zone for node in layout.nodes.values()},
         key=lambda zone: min(
@@ -103,7 +140,7 @@ def enlarge_layout(layout: DrawingLayout) -> DrawingLayout:
             continue
         # Nodes sharing a month need separate rows; backward links must not
         # create a chain that reverses the chronological x-axis.
-        if month_index[task_month[link.pred_uid]] >= month_index[task_month[link.succ_uid]]:
+        if period_index[task_period[link.pred_uid]] >= period_index[task_period[link.succ_uid]]:
             continue
         pred_zone = layout.nodes[link.pred_uid].task.zone
         succ_zone = layout.nodes[link.succ_uid].task.zone
@@ -116,7 +153,7 @@ def enlarge_layout(layout: DrawingLayout) -> DrawingLayout:
         pred = layout.nodes[pred_uid].task
         successors.sort(
             key=lambda uid: (
-                month_index[task_month[uid]] - month_index[task_month[pred_uid]],
+                period_index[task_period[uid]] - period_index[task_period[pred_uid]],
                 pred.zone != layout.nodes[uid].task.zone,
                 not (pred.critical and layout.nodes[uid].task.critical),
                 abs(pred.task_id - layout.nodes[uid].task.task_id),
@@ -196,14 +233,14 @@ def enlarge_layout(layout: DrawingLayout) -> DrawingLayout:
         group_chains = [chain for chain in chains if chain_group(chain) == group]
         group_chains.sort(
             key=lambda chain: (
-                min(month_index[task_month[uid]] for uid in chain),
+                min(period_index[task_period[uid]] for uid in chain),
                 -len(chain),
                 layout.nodes[chain[0]].task.task_id,
             )
         )
         occupied_by_row: list[set[int]] = []
         for chain in group_chains:
-            chain_ranks = sorted(month_index[task_month[uid]] for uid in chain)
+            chain_ranks = sorted(period_index[task_period[uid]] for uid in chain)
             reserved_ranks: set[int] = set()
             if len(chain_ranks) == 1:
                 reserved_ranks.add(chain_ranks[0])
@@ -225,7 +262,7 @@ def enlarge_layout(layout: DrawingLayout) -> DrawingLayout:
             cursor += len(occupied_by_row) + 1
 
     for uid, node in layout.nodes.items():
-        node.x = month_index[task_month[uid]] * X_SPACING
+        node.x = period_index[task_period[uid]] * X_SPACING
         node.y = -row_assignment[uid] * Y_SPACING
         node.task.row = row_assignment[uid]
 
@@ -243,13 +280,15 @@ def enlarge_layout(layout: DrawingLayout) -> DrawingLayout:
         "chains": len(chains),
         "rows": max(row_assignment.values()) + 1,
         "group_rows": group_row_counts,
-        "months": len(months),
+        "time_periods": len(periods),
+        "time_scale": scale,
     }
 
-    layout.time_axis = [
-        (f"{year:04d}-{month:02d}", index * X_SPACING + NODE_WIDTH / 2)
-        for index, (year, month) in enumerate(months)
+    layout.time_axis = [] if scale == "none" else [
+        (period_label(period, scale), index * X_SPACING + NODE_WIDTH / 2)
+        for index, period in enumerate(periods)
     ]
+    layout.time_axis_title = "" if scale == "none" else f"時間座標（{TIME_SCALE_TITLES[scale]}）"
 
     layout.min_x = min(node.x for node in layout.nodes.values()) - 270.0
     layout.max_x = max(node.x for node in layout.nodes.values()) + NODE_WIDTH + 90.0
@@ -366,7 +405,11 @@ class EzdxfAonWriter:
         self.doc.header["$EXTMAX"] = (layout.max_x, layout.max_y, 0)
         for name, attrs in LAYER_CONFIG.items():
             if name not in self.doc.layers:
-                self.doc.layers.add(name, **attrs)
+                layer_attrs = {key: value for key, value in attrs.items() if key != "true_color"}
+                layer = self.doc.layers.add(name, **layer_attrs)
+                if "true_color" in attrs:
+                    value = attrs["true_color"]
+                    layer.rgb = ((value >> 16) & 255, (value >> 8) & 255, value & 255)
         if "AON_TC" not in self.doc.styles:
             self.doc.styles.add("AON_TC", font="msjh.ttc")
         if "AON_LATIN" not in self.doc.styles:
@@ -998,7 +1041,7 @@ class EzdxfAonWriter:
             boundaries = [centers[0] - X_SPACING / 2]
             boundaries.extend((left + right) / 2 for left, right in zip(centers, centers[1:]))
             boundaries.append(centers[-1] + X_SPACING / 2)
-            self.text("AON_TITLE", self.layout.min_x + 6, axis_y + 16, 5.5, "時間座標（月）", max_width=150.0)
+            self.text("AON_TITLE", self.layout.min_x + 6, axis_y + 16, 5.5, self.layout.time_axis_title, max_width=150.0)
             self.line("AON_LANE", boundaries[0], axis_y, boundaries[-1], axis_y)
             for boundary in boundaries:
                 self.line("AON_LANE", boundary, axis_y, boundary, self.layout.min_y + 12)

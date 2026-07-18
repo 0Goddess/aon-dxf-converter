@@ -24,7 +24,7 @@ from project_aon_ezdxf import EzdxfAonWriter, enlarge_layout
 
 
 APP_NAME = "Project XML 轉 AON DXF"
-APP_VERSION = "1.2.0"
+APP_VERSION = "1.3.0"
 OUTPUT_SUFFIX = "_AON全區_AutoCAD2023.dxf"
 
 
@@ -63,6 +63,7 @@ def convert_project(
     output_directory: Path,
     *,
     overwrite: bool = False,
+    time_scale: str = "auto",
     progress: Callable[[int, str], None] | None = None,
 ) -> ConversionResult:
     def update(percent: int, message: str) -> None:
@@ -94,7 +95,10 @@ def convert_project(
         or xml_path.stem
     )
     update(25, f"建立 AON 網路與版面（{len(model.tasks)} 個作業）…")
-    layout = enlarge_layout(build_layout(model, f"{project_name}｜AON全工程網圖", None))
+    layout = enlarge_layout(
+        build_layout(model, f"{project_name}｜AON全工程網圖", None),
+        time_scale=time_scale,
+    )
 
     with tempfile.TemporaryDirectory(prefix=".aon_build_", dir=output_directory) as temp_dir:
         temp_root = Path(temp_dir)
@@ -168,6 +172,7 @@ def run_gui() -> None:
             self.xml_value = tk.StringVar()
             self.output_value = tk.StringVar()
             self.open_folder_value = tk.BooleanVar(value=True)
+            self.time_scale_value = tk.StringVar(value="自動")
             self.status_value = tk.StringVar(value="請選擇 Microsoft Project XML。")
             self.progress_value = tk.IntVar(value=0)
 
@@ -193,6 +198,14 @@ def run_gui() -> None:
             options = ttk.Frame(container)
             options.pack(fill="x", pady=(10, 0))
             ttk.Checkbutton(options, text="完成後開啟輸出資料夾", variable=self.open_folder_value).pack(side="left")
+            ttk.Label(options, text="時間分隔：").pack(side="left", padx=(18, 4))
+            ttk.Combobox(
+                options,
+                textvariable=self.time_scale_value,
+                values=("自動", "週", "月", "季", "年", "關閉時間軸"),
+                state="readonly",
+                width=11,
+            ).pack(side="left")
             ttk.Label(options, text="ES／EF／LS／LF／TF／FF 以 XML 計算結果為準").pack(side="right")
 
             action = ttk.Frame(container)
@@ -256,6 +269,9 @@ def run_gui() -> None:
             self.convert_button.configure(state="disabled")
             self.append_log(f"輸入：{xml_path}")
             self.append_log(f"輸出：{final_path}")
+            scale_map = {"自動": "auto", "週": "week", "月": "month", "季": "quarter", "年": "year", "關閉時間軸": "none"}
+            selected_scale = scale_map[self.time_scale_value.get()]
+            self.append_log(f"時間分隔：{self.time_scale_value.get()}")
             self.status_value.set("轉換中…")
 
             def progress(percent: int, message: str) -> None:
@@ -267,6 +283,7 @@ def run_gui() -> None:
                         xml_path,
                         output_directory,
                         overwrite=overwrite,
+                        time_scale=selected_scale,
                         progress=progress,
                     )
                     self.events.put(("done", result))
@@ -329,6 +346,12 @@ def main() -> int:
     parser.add_argument("--convert", type=Path, metavar="PROJECT_XML", help="以命令列轉換指定 XML")
     parser.add_argument("--output", type=Path, metavar="DIRECTORY", help="輸出資料夾")
     parser.add_argument("--overwrite", action="store_true", help="覆寫既有 DXF")
+    parser.add_argument(
+        "--time-scale",
+        choices=("auto", "week", "month", "quarter", "year", "none"),
+        default="auto",
+        help="時間軸分隔",
+    )
     parser.add_argument("--version", action="version", version=f"%(prog)s {APP_VERSION}")
     args = parser.parse_args()
 
@@ -339,6 +362,7 @@ def main() -> int:
                 args.convert,
                 output,
                 overwrite=args.overwrite,
+                time_scale=args.time_scale,
                 progress=lambda percent, message: print(f"[{percent:3d}%] {message}", flush=True),
             )
         except Exception as error:
