@@ -53,8 +53,8 @@ X_SPACING = 250.0
 Y_SPACING = 145.0
 ARROW_LENGTH = 4.8
 ARROW_HALF_HEIGHT = 3.1
-MIN_VERTICAL_CHANNEL_SPACING = 10.0
-MIN_HORIZONTAL_CHANNEL_SPACING = 6.0
+MIN_VERTICAL_CHANNEL_SPACING = 14.0
+MIN_HORIZONTAL_CHANNEL_SPACING = 9.0
 
 
 TIME_SCALE_TITLES = {"week": "週", "month": "月", "quarter": "季", "year": "年"}
@@ -322,6 +322,38 @@ def enlarge_layout(layout: DrawingLayout, time_scale: str = "month") -> DrawingL
     for zone in zone_order:
         rows = sorted({row_assignment[uid] for uid, node in layout.nodes.items() if uid not in critical_uids and node.task.zone == zone})
         noncritical_rows_by_zone[zone] = rows
+
+    # Barycentric row sweeps reduce crossings without changing the requested
+    # zone order (zones with fewer activities remain above larger zones).
+    row_members: dict[int, list[int]] = collections.defaultdict(list)
+    for uid, old_row in row_assignment.items():
+        if uid not in critical_uids:
+            row_members[old_row].append(uid)
+    linked_rows: dict[int, list[int | None]] = collections.defaultdict(list)
+    for link in layout.links:
+        pred_row = None if link.pred_uid in critical_uids else row_assignment[link.pred_uid]
+        succ_row = None if link.succ_uid in critical_uids else row_assignment[link.succ_uid]
+        if pred_row is not None:
+            linked_rows[pred_row].append(succ_row)
+        if succ_row is not None:
+            linked_rows[succ_row].append(pred_row)
+
+    for _ in range(6):
+        flat_rows = [row for zone in zone_order for row in noncritical_rows_by_zone[zone]]
+        split_hint = (len(flat_rows) + 1) // 2
+        provisional = {
+            row: (split_hint - index if index < split_hint else -(index - split_hint + 1))
+            for index, row in enumerate(flat_rows)
+        }
+        for zone in zone_order:
+            def barycenter(row: int) -> float:
+                neighbors = linked_rows.get(row, [])
+                if not neighbors:
+                    return float(provisional.get(row, 0))
+                return sum(0.0 if neighbor is None else provisional.get(neighbor, 0) for neighbor in neighbors) / len(neighbors)
+            noncritical_rows_by_zone[zone].sort(
+                key=lambda row: (-barycenter(row), len(row_members[row]), min(layout.nodes[uid].task.task_id for uid in row_members[row]))
+            )
     ordered_noncritical_rows = [
         (zone, row)
         for zone in zone_order
@@ -577,8 +609,8 @@ class EzdxfAonWriter:
             assignment, count = assign_interval_lanes(items, clearance=3.0)
             maximum_direct_lanes = max(maximum_direct_lanes, count)
             # Keep horizontal arrows inside the operation-name compartment.
-            top_offset = 10.0
-            usable_height = 44.0
+            top_offset = 2.0
+            usable_height = NODE_HEIGHT - 4.0
             for link_index, lane in assignment.items():
                 direct_level[link_index] = row_y - top_offset - (lane + 1) * usable_height / (count + 1)
 
@@ -658,8 +690,8 @@ class EzdxfAonWriter:
             base_x = tx - arrow_direction * ARROW_LENGTH
 
             source_count = port_count[(link.index, "pred")]
-            source_spacing = min(7.0, 60.0 / max(1, source_count - 1))
-            source_offset = 8.0 + port_slot[(link.index, "pred")] * source_spacing
+            source_spacing = min(12.0, 84.0 / max(1, source_count - 1))
+            source_offset = 10.0 + port_slot[(link.index, "pred")] * source_spacing
             source_bend_x = sx + source_offset * (1 if source_side == "R" else -1)
             channel_direction = -1 if succ.y <= pred.y else 1
             base[link.index] = {
@@ -981,9 +1013,9 @@ class EzdxfAonWriter:
                     # Very high-degree endpoints can have fixed port levels
                     # closer than the preferred spacing.  Keep node avoidance
                     # mandatory and relax only parallel clearance in that case.
-                    for source_step in range(40):
+                    for source_step in range(28):
                         source_x = source_x0 + source_shift * source_step * MIN_VERTICAL_CHANNEL_SPACING
-                        for target_step in range(40):
+                        for target_step in range(28):
                             target_x = target_x0 + target_shift * target_step * MIN_VERTICAL_CHANNEL_SPACING
                             candidate = simplify_points(
                                 [
@@ -995,7 +1027,7 @@ class EzdxfAonWriter:
                                     arrow_base,
                                 ]
                             )
-                            if not path_hits_node(link, candidate):
+                            if path_is_clear(link, candidate):
                                 selected_points = candidate
                                 relaxed_detour_links += 1
                                 break
@@ -1008,7 +1040,8 @@ class EzdxfAonWriter:
                     # fallback both reliable and reasonably fast.
                     node_top = max(node.y for node in self.layout.nodes.values())
                     node_bottom = min(node.y - NODE_HEIGHT for node in self.layout.nodes.values())
-                    outside_levels = (node_top + 2 * Y_SPACING, node_bottom - 2 * Y_SPACING)
+                    lane_offset = (2 + emergency_detour_links) * Y_SPACING
+                    outside_levels = (node_top + lane_offset, node_bottom - lane_offset)
 
                     def corridor_candidates(origin: float) -> list[float]:
                         values = [origin]
@@ -1020,14 +1053,14 @@ class EzdxfAonWriter:
                         source_candidates = []
                         for source_x in corridor_candidates(source_x0):
                             partial = simplify_points([start, (source_x, start[1]), (source_x, outside_y)])
-                            if not path_hits_node(link, partial):
+                            if not path_hits_node(link, partial) and path_has_channel_clearance(partial):
                                 source_candidates.append(source_x)
                                 if len(source_candidates) >= 12:
                                     break
                         target_candidates = []
                         for target_x in corridor_candidates(target_x0):
                             partial = simplify_points([(target_x, outside_y), (target_x, arrow_base[1]), arrow_base])
-                            if not path_hits_node(link, partial):
+                            if not path_hits_node(link, partial) and path_has_channel_clearance(partial):
                                 target_candidates.append(target_x)
                                 if len(target_candidates) >= 12:
                                     break
@@ -1039,7 +1072,7 @@ class EzdxfAonWriter:
                             candidate = simplify_points(
                                 [start, (source_x, start[1]), (source_x, outside_y), (target_x, outside_y), (target_x, arrow_base[1]), arrow_base]
                             )
-                            if not path_hits_node(link, candidate):
+                            if path_is_clear(link, candidate):
                                 selected_points = candidate
                                 emergency_detour_links += 1
                                 break
@@ -1049,9 +1082,30 @@ class EzdxfAonWriter:
                     # Absolute last resort: preserve a valid relationship
                     # object and complete the drawing instead of aborting the
                     # whole conversion because of one unusually dense link.
-                    outside_y = max(node.y for node in self.layout.nodes.values()) + 3 * Y_SPACING
+                    forced_slot = forced_detour_links + 1
+                    # Keep endpoint stubs short; the endpoint port and unique
+                    # outer Y lane provide separation without long overlaps.
+                    forced_source_x = source_x0 + source_shift * forced_slot * 2.5
+                    forced_target_x = target_x0 + target_shift * forced_slot * 2.5
+                    outside_y = max(node.y for node in self.layout.nodes.values()) + (3 + forced_slot) * Y_SPACING
+                    lane_sign = 1 if int(geometry["channel_direction"]) > 0 else -1
+                    source_lane_y = start[1] + lane_sign * forced_slot * 1.37
+                    target_lane_y = arrow_base[1] + lane_sign * forced_slot * 1.37
+                    source_port_x = source_x0 + source_shift * forced_slot * 0.41
+                    target_port_x = target_x0 + target_shift * forced_slot * 0.41
                     selected_points = simplify_points(
-                        [start, (source_x0, start[1]), (source_x0, outside_y), (target_x0, outside_y), (target_x0, arrow_base[1]), arrow_base]
+                        [
+                            start,
+                            (source_port_x, start[1]),
+                            (source_port_x, source_lane_y),
+                            (forced_source_x, source_lane_y),
+                            (forced_source_x, outside_y),
+                            (forced_target_x, outside_y),
+                            (forced_target_x, target_lane_y),
+                            (target_port_x, target_lane_y),
+                            (target_port_x, arrow_base[1]),
+                            arrow_base,
+                        ]
                     )
                     forced_detour_links += 1
                 route_mode = "detour"
@@ -1063,6 +1117,67 @@ class EzdxfAonWriter:
             geometry_by_link[link.index] = geometry
             register_path(selected_points)
 
+        # Final whole-drawing de-overlap pass.  Local routing decisions cannot
+        # always see a later emergency path from another zone.  Re-route any
+        # remaining collinear segment onto a unique outer lane.
+        accepted_segments: list[tuple[tuple[float, float], tuple[float, float]]] = []
+        deoverlap_links = 0
+        link_by_index = {link.index: link for link in self.layout.links}
+        node_top = max(node.y for node in self.layout.nodes.values())
+        node_bottom = min(node.y - NODE_HEIGHT for node in self.layout.nodes.values())
+
+        def overlaps_accepted(points: list[tuple[float, float]]) -> bool:
+            return any(
+                collinear_overlap(segment, accepted)
+                for segment in orthogonal_segments(points)
+                for accepted in accepted_segments
+            )
+
+        for link_index in sorted(geometry_by_link):
+            geometry = geometry_by_link[link_index]
+            points = list(geometry["points"])
+            if overlaps_accepted(points):
+                link = link_by_index[link_index]
+                start = (float(geometry["start"][0]), float(geometry["start"][1]))
+                arrow_base = (float(geometry["base"][0]), float(geometry["base"][1]))
+                source_shift = 1 if geometry.get("source_side", "R") == "R" else -1
+                target_shift = -int(geometry["arrow_direction"])
+                chosen = None
+                for attempt in range(1, 401):
+                    slot = deoverlap_links * 401 + attempt
+                    side = 1 if slot % 2 else -1
+                    outside_y = node_top + (4 + slot) * 3.0 if side > 0 else node_bottom - (4 + slot) * 3.0
+                    source_exit_x = start[0] + source_shift * (3.0 + attempt * 0.17)
+                    target_exit_x = arrow_base[0] + target_shift * (3.0 + attempt * 0.17)
+                    source_lane_y = start[1] + side * (5.0 + slot * 0.73)
+                    target_lane_y = arrow_base[1] + side * (5.0 + slot * 0.73)
+                    source_outer_x = source_exit_x + source_shift * (8.0 + slot * 0.91)
+                    target_outer_x = target_exit_x + target_shift * (8.0 + slot * 0.91)
+                    candidate = simplify_points(
+                        [
+                            start,
+                            (source_exit_x, start[1]),
+                            (source_exit_x, source_lane_y),
+                            (source_outer_x, source_lane_y),
+                            (source_outer_x, outside_y),
+                            (target_outer_x, outside_y),
+                            (target_outer_x, target_lane_y),
+                            (target_exit_x, target_lane_y),
+                            (target_exit_x, arrow_base[1]),
+                            arrow_base,
+                        ]
+                    )
+                    if not overlaps_accepted(candidate):
+                        chosen = candidate
+                        break
+                if chosen is not None:
+                    points = chosen
+                    geometry["points"] = points
+                    geometry["label_position"] = label_position(points)
+                    geometry["route_mode"] = "deoverlap_outer"
+                    deoverlap_links += 1
+            accepted_segments.extend(orthogonal_segments(points))
+
         return geometry_by_link, {
             "direct_links": len(direct_geometry),
             "routed_links": len(routed_links),
@@ -1073,6 +1188,7 @@ class EzdxfAonWriter:
             "relaxed_detour_links": relaxed_detour_links,
             "emergency_detour_links": emergency_detour_links,
             "forced_detour_links": forced_detour_links,
+            "deoverlap_links": deoverlap_links,
             "upper_channel_links": sum(
                 int(base[link.index].get("channel_direction", 0)) > 0
                 and geometry_by_link[link.index].get("route_mode") == "detour"
