@@ -24,7 +24,7 @@ from project_aon_ezdxf import EzdxfAonWriter, enlarge_layout
 
 
 APP_NAME = "Project XML 轉 AON DXF"
-APP_VERSION = "1.3.0"
+APP_VERSION = "1.4.0"
 OUTPUT_SUFFIX = "_AON全區_AutoCAD2023.dxf"
 
 
@@ -64,6 +64,7 @@ def convert_project(
     *,
     overwrite: bool = False,
     time_scale: str = "auto",
+    zone_level: str = "auto",
     progress: Callable[[int, str], None] | None = None,
 ) -> ConversionResult:
     def update(percent: int, message: str) -> None:
@@ -85,7 +86,7 @@ def convert_project(
         raise FileExistsError(f"輸出檔已存在：{final_path}")
 
     update(8, "讀取 Project XML…")
-    model = parse_project(xml_path)
+    model = parse_project(xml_path, zone_level=zone_level)
     if not model.tasks:
         raise ValueError("XML 中沒有可繪製的非摘要作業。")
 
@@ -160,7 +161,7 @@ def run_gui() -> None:
         def __init__(self) -> None:
             self.root = tk.Tk()
             self.root.title(f"{APP_NAME} {APP_VERSION}")
-            self.root.geometry("780x560")
+            self.root.geometry("820x590")
             self.root.minsize(720, 520)
             self.events: queue.Queue[tuple[str, object]] = queue.Queue()
             self.worker: threading.Thread | None = None
@@ -173,6 +174,7 @@ def run_gui() -> None:
             self.output_value = tk.StringVar()
             self.open_folder_value = tk.BooleanVar(value=True)
             self.time_scale_value = tk.StringVar(value="自動")
+            self.zone_level_value = tk.StringVar(value="自動")
             self.status_value = tk.StringVar(value="請選擇 Microsoft Project XML。")
             self.progress_value = tk.IntVar(value=0)
 
@@ -207,6 +209,18 @@ def run_gui() -> None:
                 width=11,
             ).pack(side="left")
             ttk.Label(options, text="ES／EF／LS／LF／TF／FF 以 XML 計算結果為準").pack(side="right")
+
+            zone_options = ttk.Frame(container)
+            zone_options.pack(fill="x", pady=(8, 0))
+            ttk.Label(zone_options, text="分區方式：").pack(side="left")
+            ttk.Combobox(
+                zone_options,
+                textvariable=self.zone_level_value,
+                values=("自動", "不分區", "WBS 第1層", "WBS 第2層", "WBS 第3層"),
+                state="readonly",
+                width=14,
+            ).pack(side="left", padx=(4, 0))
+            ttk.Label(zone_options, text="使用所選層級的摘要作業名稱作為分區").pack(side="left", padx=(10, 0))
 
             action = ttk.Frame(container)
             action.pack(fill="x", pady=(14, 0))
@@ -271,7 +285,10 @@ def run_gui() -> None:
             self.append_log(f"輸出：{final_path}")
             scale_map = {"自動": "auto", "週": "week", "月": "month", "季": "quarter", "年": "year", "關閉時間軸": "none"}
             selected_scale = scale_map[self.time_scale_value.get()]
+            zone_map = {"自動": "auto", "不分區": "none", "WBS 第1層": "1", "WBS 第2層": "2", "WBS 第3層": "3"}
+            selected_zone_level = zone_map[self.zone_level_value.get()]
             self.append_log(f"時間分隔：{self.time_scale_value.get()}")
+            self.append_log(f"分區方式：{self.zone_level_value.get()}")
             self.status_value.set("轉換中…")
 
             def progress(percent: int, message: str) -> None:
@@ -284,6 +301,7 @@ def run_gui() -> None:
                         output_directory,
                         overwrite=overwrite,
                         time_scale=selected_scale,
+                        zone_level=selected_zone_level,
                         progress=progress,
                     )
                     self.events.put(("done", result))
@@ -352,6 +370,12 @@ def main() -> int:
         default="auto",
         help="時間軸分隔",
     )
+    parser.add_argument(
+        "--zone-level",
+        choices=("auto", "none", "1", "2", "3"),
+        default="auto",
+        help="分區使用的 WBS 摘要層級",
+    )
     parser.add_argument("--version", action="version", version=f"%(prog)s {APP_VERSION}")
     args = parser.parse_args()
 
@@ -363,6 +387,7 @@ def main() -> int:
                 output,
                 overwrite=args.overwrite,
                 time_scale=args.time_scale,
+                zone_level=args.zone_level,
                 progress=lambda percent, message: print(f"[{percent:3d}%] {message}", flush=True),
             )
         except Exception as error:

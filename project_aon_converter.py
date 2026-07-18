@@ -104,7 +104,7 @@ def compact_number(value: float | None) -> str:
     return f"{value:.1f}".rstrip("0").rstrip(".")
 
 
-def zone_from_outline(outline: str, summary_names: dict[str, str]) -> str:
+def zone_from_outline(outline: str, summary_names: dict[str, str], zone_level: str = "auto") -> str:
     """Return a project-specific lane name instead of assuming A1/A2/B WBS codes.
 
     The second outline level normally represents the owner's phase, building,
@@ -112,10 +112,13 @@ def zone_from_outline(outline: str, summary_names: dict[str, str]) -> str:
     file.  Shallow/irregular schedules fall back to their nearest summary and
     finally to one neutral lane.
     """
+    if zone_level == "none":
+        return "全工程"
     pieces = [piece for piece in outline.split(".") if piece]
     candidates: list[str] = []
-    if len(pieces) >= 2:
-        candidates.append(".".join(pieces[:2]))
+    requested_level = 2 if zone_level == "auto" else int(zone_level)
+    if len(pieces) >= requested_level:
+        candidates.append(".".join(pieces[:requested_level]))
     candidates.extend(".".join(pieces[:length]) for length in range(len(pieces) - 1, 0, -1))
     for candidate in candidates:
         name = " ".join(summary_names.get(candidate, "").split())
@@ -236,7 +239,7 @@ class ProjectModel:
     critical_limit_days: float
 
 
-def parse_project(path: Path) -> ProjectModel:
+def parse_project(path: Path, zone_level: str = "auto") -> ProjectModel:
     root = ET.parse(path).getroot()
     minutes_per_day = child_int(root, "MinutesPerDay", 480)
     critical_limit_days = child_int(root, "CriticalSlackLimit", 0) / 10 / minutes_per_day
@@ -362,7 +365,7 @@ def parse_project(path: Path) -> ProjectModel:
             calendar_uid=child_int(node, "CalendarUID", -1),
             is_null=bool(child_int(node, "IsNull", 0)),
             external=bool(child_int(node, "ExternalTask", 0)),
-            zone=zone_from_outline(outline, summary_names),
+            zone=zone_from_outline(outline, summary_names, zone_level),
         )
         tasks_all[uid] = task
         for pred_node in node.findall("p:PredecessorLink", NS):
