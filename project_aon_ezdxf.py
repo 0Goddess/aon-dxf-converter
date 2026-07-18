@@ -1126,10 +1126,31 @@ class EzdxfAonWriter:
         node_top = max(node.y for node in self.layout.nodes.values())
         node_bottom = min(node.y - NODE_HEIGHT for node in self.layout.nodes.values())
 
+        def segments_too_close(
+            first: tuple[tuple[float, float], tuple[float, float]],
+            second: tuple[tuple[float, float], tuple[float, float]],
+        ) -> bool:
+            (a, b), (c, d) = first, second
+            first_vertical = math.isclose(a[0], b[0], abs_tol=1e-6)
+            second_vertical = math.isclose(c[0], d[0], abs_tol=1e-6)
+            first_horizontal = math.isclose(a[1], b[1], abs_tol=1e-6)
+            second_horizontal = math.isclose(c[1], d[1], abs_tol=1e-6)
+            if first_vertical and second_vertical:
+                return abs(a[0] - c[0]) < MIN_VERTICAL_CHANNEL_SPACING and spans_overlap(a[1], b[1], c[1], d[1])
+            if first_horizontal and second_horizontal:
+                return abs(a[1] - c[1]) < MIN_HORIZONTAL_CHANNEL_SPACING and spans_overlap(a[0], b[0], c[0], d[0])
+            return False
+
         def overlaps_accepted(points: list[tuple[float, float]]) -> bool:
+            segments = orthogonal_segments(points)
+            # The first/last segment is the short fan-out between a fixed node
+            # port and its channel.  High-degree nodes cannot physically keep
+            # full channel clearance inside a 64-unit edge; enforce clearance
+            # after those short endpoint stubs.
+            channel_segments = segments[1:-1] if len(segments) > 2 else []
             return any(
-                collinear_overlap(segment, accepted)
-                for segment in orthogonal_segments(points)
+                segments_too_close(segment, accepted)
+                for segment in channel_segments
                 for accepted in accepted_segments
             )
 
@@ -1144,15 +1165,15 @@ class EzdxfAonWriter:
                 target_shift = -int(geometry["arrow_direction"])
                 chosen = None
                 for attempt in range(1, 401):
-                    slot = deoverlap_links * 401 + attempt
+                    slot = deoverlap_links + attempt
                     side = 1 if slot % 2 else -1
-                    outside_y = node_top + (4 + slot) * 3.0 if side > 0 else node_bottom - (4 + slot) * 3.0
-                    source_exit_x = start[0] + source_shift * (3.0 + attempt * 0.17)
-                    target_exit_x = arrow_base[0] + target_shift * (3.0 + attempt * 0.17)
-                    source_lane_y = start[1] + side * (5.0 + slot * 0.73)
-                    target_lane_y = arrow_base[1] + side * (5.0 + slot * 0.73)
-                    source_outer_x = source_exit_x + source_shift * (8.0 + slot * 0.91)
-                    target_outer_x = target_exit_x + target_shift * (8.0 + slot * 0.91)
+                    outside_y = node_top + (4 + slot) * 11.0 if side > 0 else node_bottom - (4 + slot) * 11.0
+                    source_exit_x = start[0] + source_shift * (3.0 + attempt * 15.0)
+                    target_exit_x = arrow_base[0] + target_shift * (3.0 + attempt * 15.0)
+                    source_lane_y = start[1] + side * (5.0 + slot * 11.0)
+                    target_lane_y = arrow_base[1] + side * (5.0 + slot * 11.0)
+                    source_outer_x = source_exit_x + source_shift * (8.0 + slot * 16.0)
+                    target_outer_x = target_exit_x + target_shift * (8.0 + slot * 16.0)
                     candidate = simplify_points(
                         [
                             start,
@@ -1176,7 +1197,8 @@ class EzdxfAonWriter:
                     geometry["label_position"] = label_position(points)
                     geometry["route_mode"] = "deoverlap_outer"
                     deoverlap_links += 1
-            accepted_segments.extend(orthogonal_segments(points))
+            segments = orthogonal_segments(points)
+            accepted_segments.extend(segments[1:-1] if len(segments) > 2 else [])
 
         return geometry_by_link, {
             "direct_links": len(direct_geometry),
