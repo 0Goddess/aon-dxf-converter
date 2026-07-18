@@ -37,11 +37,11 @@ LAYER_CONFIG = {
     "AON_WARNING": {"color": 30},
     "AON_BOUNDARY": {"color": 9, "linetype": "DASHED"},
     "AON_TEXT": {"color": 7},
-    "AON_LINK_FS": {"color": 8, "true_color": 0x596673},
-    "AON_LINK_SS": {"color": 4, "true_color": 0x007A99},
-    "AON_LINK_FF": {"color": 3, "true_color": 0x087A4B},
-    "AON_LINK_SF": {"color": 6, "true_color": 0x77508F},
-    "AON_LINK_CRITICAL": {"color": 1, "true_color": 0xB80000},
+    "AON_LINK_FS": {"color": 5, "true_color": 0x4DA6FF, "lineweight": 25},
+    "AON_LINK_SS": {"color": 4, "true_color": 0x00D5D8, "lineweight": 25},
+    "AON_LINK_FF": {"color": 3, "true_color": 0x2ECC71, "lineweight": 25},
+    "AON_LINK_SF": {"color": 6, "true_color": 0xFF4FD8, "lineweight": 25},
+    "AON_LINK_CRITICAL": {"color": 1, "true_color": 0xFF3030, "lineweight": 35},
 }
 
 
@@ -128,9 +128,7 @@ def enlarge_layout(layout: DrawingLayout, time_scale: str = "month") -> DrawingL
     period_index = {period: index for index, period in enumerate(periods)}
     zone_order = sorted(
         {node.task.zone for node in layout.nodes.values()},
-        key=lambda zone: min(
-            node.task.task_id for node in layout.nodes.values() if node.task.zone == zone
-        ),
+        key=lambda zone: min(task_dates(node.task)[0] for node in layout.nodes.values() if node.task.zone == zone),
     )
     major_zones = set(zone_order)
 
@@ -233,8 +231,9 @@ def enlarge_layout(layout: DrawingLayout, time_scale: str = "month") -> DrawingL
         group_chains = [chain for chain in chains if chain_group(chain) == group]
         group_chains.sort(
             key=lambda chain: (
-                min(period_index[task_period[uid]] for uid in chain),
                 -len(chain),
+                min(task_dates(layout.nodes[uid].task)[0] for uid in chain),
+                min(period_index[task_period[uid]] for uid in chain),
                 layout.nodes[chain[0]].task.task_id,
             )
         )
@@ -257,6 +256,23 @@ def enlarge_layout(layout: DrawingLayout, time_scale: str = "month") -> DrawingL
             occupied_by_row[row].update(reserved_ranks)
             for uid in chain:
                 row_assignment[uid] = cursor + row
+        # Moving a complete packed row does not add bends: aligned dependency
+        # chains remain aligned.  Sort those rows by their earliest ES so that
+        # earlier work is consistently above later work.
+        local_rows = range(len(occupied_by_row))
+        ordered_rows = sorted(
+            local_rows,
+            key=lambda row: min(
+                task_dates(layout.nodes[uid].task)[0]
+                for uid in row_assignment
+                if row_assignment[uid] == cursor + row
+            ),
+        )
+        remap = {old_row: new_row for new_row, old_row in enumerate(ordered_rows)}
+        for uid in list(row_assignment):
+            old_row = row_assignment[uid] - cursor
+            if old_row in remap:
+                row_assignment[uid] = cursor + remap[old_row]
         group_row_counts[group] = len(occupied_by_row)
         if occupied_by_row:
             cursor += len(occupied_by_row) + 1

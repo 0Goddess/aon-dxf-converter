@@ -24,7 +24,7 @@ from project_aon_ezdxf import EzdxfAonWriter, enlarge_layout
 
 
 APP_NAME = "Project XML 轉 AON DXF"
-APP_VERSION = "1.4.0"
+APP_VERSION = "1.5.0"
 OUTPUT_SUFFIX = "_AON全區_AutoCAD2023.dxf"
 
 
@@ -192,7 +192,7 @@ def run_gui() -> None:
             ttk.Entry(input_group, textvariable=self.xml_value).pack(side="left", fill="x", expand=True)
             ttk.Button(input_group, text="瀏覽…", command=self.choose_xml, width=11).pack(side="left", padx=(8, 0))
 
-            output_group = ttk.LabelFrame(container, text="2. 選擇輸出資料夾", padding=10)
+            output_group = ttk.LabelFrame(container, text="2. 輸出位置（預設與 XML 同資料夾）", padding=10)
             output_group.pack(fill="x", pady=(12, 0))
             ttk.Entry(output_group, textvariable=self.output_value).pack(side="left", fill="x", expand=True)
             ttk.Button(output_group, text="瀏覽…", command=self.choose_output, width=11).pack(side="left", padx=(8, 0))
@@ -249,8 +249,7 @@ def run_gui() -> None:
             if not selected:
                 return
             self.xml_value.set(selected)
-            if not self.output_value.get():
-                self.output_value.set(str(Path(selected).parent / "AON_DXF_OUTPUT"))
+            self.output_value.set(str(Path(selected).parent))
             self.status_value.set("已選擇 XML，可開始轉換。")
 
         def choose_output(self) -> None:
@@ -268,7 +267,7 @@ def run_gui() -> None:
             if self.worker and self.worker.is_alive():
                 return
             xml_path = Path(self.xml_value.get().strip())
-            output_directory = Path(self.output_value.get().strip()) if self.output_value.get().strip() else xml_path.parent / "AON_DXF_OUTPUT"
+            output_directory = Path(self.output_value.get().strip()) if self.output_value.get().strip() else xml_path.parent
             if not xml_path.is_file():
                 messagebox.showwarning(APP_NAME, "請先選擇有效的 Project XML。")
                 return
@@ -380,7 +379,7 @@ def main() -> int:
     args = parser.parse_args()
 
     if args.convert:
-        output = args.output or args.convert.resolve().parent / "AON_DXF_OUTPUT"
+        output = args.output or args.convert.resolve().parent
         try:
             result = convert_project(
                 args.convert,
