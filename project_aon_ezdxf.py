@@ -58,7 +58,13 @@ def enlarge_layout(layout: DrawingLayout) -> DrawingLayout:
     """Align a maximum set of FS links into horizontal dependency chains."""
     ranks = sorted({node.task.rank for node in layout.nodes.values()})
     rank_map = {rank: index for index, rank in enumerate(ranks)}
-    major_zones = {"A1區", "A2區", "B區"}
+    zone_order = sorted(
+        {node.task.zone for node in layout.nodes.values()},
+        key=lambda zone: min(
+            node.task.task_id for node in layout.nodes.values() if node.task.zone == zone
+        ),
+    )
+    major_zones = set(zone_order)
 
     adjacency: dict[int, list[int]] = collections.defaultdict(list)
     for link in layout.links:
@@ -66,7 +72,7 @@ def enlarge_layout(layout: DrawingLayout) -> DrawingLayout:
             continue
         pred_zone = layout.nodes[link.pred_uid].task.zone
         succ_zone = layout.nodes[link.succ_uid].task.zone
-        # Preserve the main A1/A2/B identity; common tasks may join any chain.
+        # Preserve the XML-derived phase/area identity between dependency chains.
         if pred_zone in major_zones and succ_zone in major_zones and pred_zone != succ_zone:
             continue
         adjacency[link.pred_uid].append(link.succ_uid)
@@ -143,19 +149,15 @@ def enlarge_layout(layout: DrawingLayout) -> DrawingLayout:
 
     def chain_group(chain: list[int]) -> str:
         zones = [layout.nodes[uid].task.zone for uid in chain]
-        for zone in ("A1區", "A2區", "B區"):
+        for zone in zone_order:
             if zone in zones:
                 return zone
-        if "驗收／送電" in zones:
-            return "驗收／送電"
-        # Common-only chains share the first main band instead of becoming a
-        # visually isolated section.
-        return "A1區"
+        return zone_order[0]
 
     row_assignment: dict[int, int] = {}
     cursor = 0
     group_row_counts: dict[str, int] = {}
-    for group in ("A1區", "A2區", "B區", "驗收／送電"):
+    for group in zone_order:
         group_chains = [chain for chain in chains if chain_group(chain) == group]
         group_chains.sort(
             key=lambda chain: (
@@ -193,7 +195,7 @@ def enlarge_layout(layout: DrawingLayout) -> DrawingLayout:
         node.task.row = row_assignment[uid]
 
     layout.lane_ranges = {}
-    for zone in ("A1區", "A2區", "B區"):
+    for zone in zone_order:
         zone_nodes = [node for node in layout.nodes.values() if node.task.zone == zone]
         if zone_nodes:
             layout.lane_ranges[zone] = (

@@ -36,7 +36,6 @@ CONSTRAINT_TYPES = {
     7: "不得晚於完成(FNLT)",
 }
 DAY_NAMES = {1: "星期日", 2: "星期一", 3: "星期二", 4: "星期三", 5: "星期四", 6: "星期五", 7: "星期六"}
-ZONE_ORDER = ["共同／前置", "A1區", "A2區", "B區", "其他共同工程", "驗收／送電"]
 ZONE_COLORS = {
     "共同／前置": "#E2E8F0",
     "A1區": "#DBEAFE",
@@ -105,20 +104,24 @@ def compact_number(value: float | None) -> str:
     return f"{value:.1f}".rstrip("0").rstrip(".")
 
 
-def zone_from_wbs(wbs: str) -> str:
-    if wbs == "1.8" or wbs.startswith("1.8."):
-        return "A1區"
-    if wbs == "1.9" or wbs.startswith("1.9."):
-        return "A2區"
-    if wbs == "1.10" or wbs.startswith("1.10."):
-        return "B區"
-    if wbs == "2" or wbs.startswith("2."):
-        return "驗收／送電"
-    if wbs.startswith("1.1") and not (wbs.startswith("1.10") or wbs.startswith("1.11") or wbs.startswith("1.12")):
-        return "共同／前置"
-    if any(wbs == f"1.{number}" or wbs.startswith(f"1.{number}.") for number in range(1, 8)):
-        return "共同／前置"
-    return "其他共同工程"
+def zone_from_outline(outline: str, summary_names: dict[str, str]) -> str:
+    """Return a project-specific lane name instead of assuming A1/A2/B WBS codes.
+
+    The second outline level normally represents the owner's phase, building,
+    or area.  Its summary name is therefore a useful lane label for any Project
+    file.  Shallow/irregular schedules fall back to their nearest summary and
+    finally to one neutral lane.
+    """
+    pieces = [piece for piece in outline.split(".") if piece]
+    candidates: list[str] = []
+    if len(pieces) >= 2:
+        candidates.append(".".join(pieces[:2]))
+    candidates.extend(".".join(pieces[:length]) for length in range(len(pieces) - 1, 0, -1))
+    for candidate in candidates:
+        name = " ".join(summary_names.get(candidate, "").split())
+        if name:
+            return name
+    return "全工程"
 
 
 def display_width(text: str) -> int:
@@ -359,7 +362,7 @@ def parse_project(path: Path) -> ProjectModel:
             calendar_uid=child_int(node, "CalendarUID", -1),
             is_null=bool(child_int(node, "IsNull", 0)),
             external=bool(child_int(node, "ExternalTask", 0)),
-            zone=zone_from_wbs(child_text(node, "WBS")),
+            zone=zone_from_outline(outline, summary_names),
         )
         tasks_all[uid] = task
         for pred_node in node.findall("p:PredecessorLink", NS):
@@ -673,7 +676,11 @@ def build_layout(model: ProjectModel, title: str, zones: set[str] | None = None)
         pred_map[link.succ_uid].append(link.pred_uid)
         succ_map[link.pred_uid].append(link.succ_uid)
 
-    zone_index = {zone: index for index, zone in enumerate(ZONE_ORDER)}
+    zone_order = sorted(
+        {task.zone for task in tasks.values()},
+        key=lambda zone: min(task.task_id for task in tasks.values() if task.zone == zone),
+    )
+    zone_index = {zone: index for index, zone in enumerate(zone_order)}
     for rank in by_rank:
         by_rank[rank].sort(key=lambda uid: (zone_index.get(tasks[uid].zone, 99), tasks[uid].task_id))
 
@@ -715,7 +722,7 @@ def build_layout(model: ProjectModel, title: str, zones: set[str] | None = None)
     lane_ranges: dict[str, tuple[float, float]] = {}
     lane_start_rows: dict[str, float] = {}
 
-    active_zones = [zone for zone in ZONE_ORDER if any(task.zone == zone for task in tasks.values())]
+    active_zones = zone_order
     if zones:
         active_zones = ["分區網圖"]
         lane_start_rows["分區網圖"] = 0
