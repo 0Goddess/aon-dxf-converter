@@ -4,11 +4,13 @@
 from __future__ import annotations
 
 import argparse
+import calendar
 import collections
 import json
 import math
 import sys
 import unicodedata
+from datetime import datetime
 from pathlib import Path
 
 sys.path.insert(0, "/tmp/ezdxf_runtime")
@@ -46,18 +48,47 @@ LAYER_CONFIG = {
 
 NODE_WIDTH = 150.0
 NODE_HEIGHT = 64.0
-X_SPACING = 285.0
-Y_SPACING = 165.0
+# Compact month grid: enough room for a 150-unit node and routing channels,
+# without allowing a multi-year schedule to expand excessively.
+X_SPACING = 250.0
+Y_SPACING = 145.0
 ARROW_LENGTH = 4.8
 ARROW_HALF_HEIGHT = 3.1
 MIN_VERTICAL_CHANNEL_SPACING = 10.0
 MIN_HORIZONTAL_CHANNEL_SPACING = 6.0
 
 
+def dominant_month(task) -> tuple[int, int]:
+    """Choose the calendar month containing the largest share of the task."""
+    start_raw = task.early_start or task.start
+    finish_raw = task.early_finish or task.finish or start_raw
+    try:
+        start = datetime.fromisoformat(start_raw).date()
+        finish = datetime.fromisoformat(finish_raw).date()
+    except (TypeError, ValueError):
+        return (1970, 1)
+    if finish < start:
+        start, finish = finish, start
+    best = (start.year, start.month)
+    best_days = -1
+    year, month = start.year, start.month
+    while (year, month) <= (finish.year, finish.month):
+        month_start = datetime(year, month, 1).date()
+        month_end = datetime(year, month, calendar.monthrange(year, month)[1]).date()
+        overlap = (min(finish, month_end) - max(start, month_start)).days + 1
+        if overlap > best_days:
+            best, best_days = (year, month), overlap
+        month = month + 1
+        if month == 13:
+            year, month = year + 1, 1
+    return best
+
+
 def enlarge_layout(layout: DrawingLayout) -> DrawingLayout:
-    """Align a maximum set of FS links into horizontal dependency chains."""
-    ranks = sorted({node.task.rank for node in layout.nodes.values()})
-    rank_map = {rank: index for index, rank in enumerate(ranks)}
+    """Lay out tasks by dominant month and align compatible FS chains."""
+    task_month = {uid: dominant_month(node.task) for uid, node in layout.nodes.items()}
+    months = sorted(set(task_month.values()))
+    month_index = {month: index for index, month in enumerate(months)}
     zone_order = sorted(
         {node.task.zone for node in layout.nodes.values()},
         key=lambda zone: min(
@@ -70,6 +101,10 @@ def enlarge_layout(layout: DrawingLayout) -> DrawingLayout:
     for link in layout.links:
         if link.relation != "FS":
             continue
+        # Nodes sharing a month need separate rows; backward links must not
+        # create a chain that reverses the chronological x-axis.
+        if month_index[task_month[link.pred_uid]] >= month_index[task_month[link.succ_uid]]:
+            continue
         pred_zone = layout.nodes[link.pred_uid].task.zone
         succ_zone = layout.nodes[link.succ_uid].task.zone
         # Preserve the XML-derived phase/area identity between dependency chains.
@@ -81,7 +116,7 @@ def enlarge_layout(layout: DrawingLayout) -> DrawingLayout:
         pred = layout.nodes[pred_uid].task
         successors.sort(
             key=lambda uid: (
-                rank_map[layout.nodes[uid].task.rank] - rank_map[pred.rank],
+                month_index[task_month[uid]] - month_index[task_month[pred_uid]],
                 pred.zone != layout.nodes[uid].task.zone,
                 not (pred.critical and layout.nodes[uid].task.critical),
                 abs(pred.task_id - layout.nodes[uid].task.task_id),
@@ -161,14 +196,14 @@ def enlarge_layout(layout: DrawingLayout) -> DrawingLayout:
         group_chains = [chain for chain in chains if chain_group(chain) == group]
         group_chains.sort(
             key=lambda chain: (
-                min(rank_map[layout.nodes[uid].task.rank] for uid in chain),
+                min(month_index[task_month[uid]] for uid in chain),
                 -len(chain),
                 layout.nodes[chain[0]].task.task_id,
             )
         )
         occupied_by_row: list[set[int]] = []
         for chain in group_chains:
-            chain_ranks = sorted(rank_map[layout.nodes[uid].task.rank] for uid in chain)
+            chain_ranks = sorted(month_index[task_month[uid]] for uid in chain)
             reserved_ranks: set[int] = set()
             if len(chain_ranks) == 1:
                 reserved_ranks.add(chain_ranks[0])
@@ -190,7 +225,7 @@ def enlarge_layout(layout: DrawingLayout) -> DrawingLayout:
             cursor += len(occupied_by_row) + 1
 
     for uid, node in layout.nodes.items():
-        node.x = rank_map[node.task.rank] * X_SPACING
+        node.x = month_index[task_month[uid]] * X_SPACING
         node.y = -row_assignment[uid] * Y_SPACING
         node.task.row = row_assignment[uid]
 
@@ -208,12 +243,18 @@ def enlarge_layout(layout: DrawingLayout) -> DrawingLayout:
         "chains": len(chains),
         "rows": max(row_assignment.values()) + 1,
         "group_rows": group_row_counts,
+        "months": len(months),
     }
+
+    layout.time_axis = [
+        (f"{year:04d}-{month:02d}", index * X_SPACING + NODE_WIDTH / 2)
+        for index, (year, month) in enumerate(months)
+    ]
 
     layout.min_x = min(node.x for node in layout.nodes.values()) - 270.0
     layout.max_x = max(node.x for node in layout.nodes.values()) + NODE_WIDTH + 90.0
     layout.min_y = min(node.y for node in layout.nodes.values()) - NODE_HEIGHT - 110.0
-    layout.max_y = max(node.y for node in layout.nodes.values()) + 190.0
+    layout.max_y = max(node.y for node in layout.nodes.values()) + 250.0
     layout.width = layout.max_x - layout.min_x
     layout.height = layout.max_y - layout.min_y
     return layout
@@ -951,6 +992,18 @@ class EzdxfAonWriter:
             "節點：ID/WBS、作業名稱、ES/D/EF、LS/TF/FF/LF；紅色為Project要徑；橘色為開放端點或手動排程；關係線為單一物件。",
             max_width=self.layout.width - 20,
         )
+        if self.layout.time_axis:
+            axis_y = self.layout.max_y - 66
+            centers = [x for _, x in self.layout.time_axis]
+            boundaries = [centers[0] - X_SPACING / 2]
+            boundaries.extend((left + right) / 2 for left, right in zip(centers, centers[1:]))
+            boundaries.append(centers[-1] + X_SPACING / 2)
+            self.text("AON_TITLE", self.layout.min_x + 6, axis_y + 16, 5.5, "時間座標（月）", max_width=150.0)
+            self.line("AON_LANE", boundaries[0], axis_y, boundaries[-1], axis_y)
+            for boundary in boundaries:
+                self.line("AON_LANE", boundary, axis_y, boundary, self.layout.min_y + 12)
+            for label, center_x in self.layout.time_axis:
+                self.text("AON_TITLE", center_x - 25, axis_y + 9, 5.2, label, max_width=50.0)
         for zone, (top, bottom) in self.layout.lane_ranges.items():
             self.text("AON_TITLE", self.layout.min_x + 6, top - 9, 5.5, zone, max_width=230.0)
             self.line("AON_LANE", self.layout.min_x + 2, top + 18, self.layout.max_x - 2, top + 18)

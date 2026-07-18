@@ -19,6 +19,7 @@ Project XML 轉 AON DXF 1.0
 - 全區 AON 網圖 DXF
 - 節點顯示 ID、WBS、作業名稱、ES、D、EF、LS、TF、FF、LF
 - 分區名稱由每份 XML 的 WBS／摘要作業自動辨識，不固定套用 A1、A2、B
+- 上方顯示月份時間座標，作業依主要占用月份排列；跨月作業以涵蓋天數最多的月份決定位置
 - 紅色：Project 要徑作業及要徑關係
 - 關係線：單一 LWPOLYLINE 物件，附前後作業 XDATA
 - 跨列關係優先採「水平－垂直－水平」兩轉折
