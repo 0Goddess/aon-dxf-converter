@@ -128,13 +128,18 @@ def enlarge_layout(layout: DrawingLayout, time_scale: str = "month") -> DrawingL
     period_index = {period: index for index, period in enumerate(periods)}
     zone_order = sorted(
         {node.task.zone for node in layout.nodes.values()},
-        key=lambda zone: min(task_dates(node.task)[0] for node in layout.nodes.values() if node.task.zone == zone),
+        key=lambda zone: (
+            sum(node.task.zone == zone for node in layout.nodes.values()),
+            min(node.task.task_id for node in layout.nodes.values() if node.task.zone == zone),
+        ),
     )
     major_zones = set(zone_order)
 
     adjacency: dict[int, list[int]] = collections.defaultdict(list)
     for link in layout.links:
         if link.relation != "FS":
+            continue
+        if layout.nodes[link.pred_uid].task.critical or layout.nodes[link.succ_uid].task.critical:
             continue
         # Nodes sharing a month need separate rows; backward links must not
         # create a chain that reverses the chronological x-axis.
@@ -232,7 +237,6 @@ def enlarge_layout(layout: DrawingLayout, time_scale: str = "month") -> DrawingL
         group_chains.sort(
             key=lambda chain: (
                 -len(chain),
-                min(task_dates(layout.nodes[uid].task)[0] for uid in chain),
                 min(period_index[task_period[uid]] for uid in chain),
                 layout.nodes[chain[0]].task.task_id,
             )
@@ -257,15 +261,17 @@ def enlarge_layout(layout: DrawingLayout, time_scale: str = "month") -> DrawingL
             for uid in chain:
                 row_assignment[uid] = cursor + row
         # Moving a complete packed row does not add bends: aligned dependency
-        # chains remain aligned.  Sort those rows by their earliest ES so that
-        # earlier work is consistently above later work.
+        # chains remain aligned.  Rows with fewer activities are placed first.
         local_rows = range(len(occupied_by_row))
         ordered_rows = sorted(
             local_rows,
-            key=lambda row: min(
-                task_dates(layout.nodes[uid].task)[0]
-                for uid in row_assignment
-                if row_assignment[uid] == cursor + row
+            key=lambda row: (
+                sum(row_assignment[uid] == cursor + row for uid in row_assignment),
+                min(
+                    layout.nodes[uid].task.task_id
+                    for uid in row_assignment
+                    if row_assignment[uid] == cursor + row
+                ),
             ),
         )
         remap = {old_row: new_row for new_row, old_row in enumerate(ordered_rows)}
@@ -277,14 +283,69 @@ def enlarge_layout(layout: DrawingLayout, time_scale: str = "month") -> DrawingL
         if occupied_by_row:
             cursor += len(occupied_by_row) + 1
 
+    # Each time period receives enough horizontal slots for every critical
+    # activity in that period.  This keeps the entire critical path on the
+    # center line without stacking critical nodes on top of each other.
+    critical_by_period: dict[tuple[int, ...], list[int]] = collections.defaultdict(list)
     for uid, node in layout.nodes.items():
-        node.x = period_index[task_period[uid]] * X_SPACING
-        node.y = -row_assignment[uid] * Y_SPACING
-        node.task.row = row_assignment[uid]
+        if node.task.critical:
+            critical_by_period[task_period[uid]].append(uid)
+    for uids in critical_by_period.values():
+        uids.sort(key=lambda uid: (layout.nodes[uid].task.rank, task_dates(layout.nodes[uid].task)[0], layout.nodes[uid].task.task_id))
+
+    period_starts: dict[tuple[int, ...], float] = {}
+    period_centers: dict[tuple[int, ...], float] = {}
+    boundaries: list[float] = []
+    cursor_x = 0.0
+    for period in periods:
+        slots = max(1, len(critical_by_period.get(period, [])))
+        period_starts[period] = cursor_x
+        first_center = cursor_x + NODE_WIDTH / 2
+        last_center = cursor_x + (slots - 1) * X_SPACING + NODE_WIDTH / 2
+        period_centers[period] = (first_center + last_center) / 2
+        if not boundaries:
+            boundaries.append(first_center - X_SPACING / 2)
+        cursor_x += slots * X_SPACING
+        boundaries.append(last_center + X_SPACING / 2)
+
+    critical_uids = {uid for uids in critical_by_period.values() for uid in uids}
+    for period, uids in critical_by_period.items():
+        for slot, uid in enumerate(uids):
+            layout.nodes[uid].x = period_starts[period] + slot * X_SPACING
+            layout.nodes[uid].y = 0.0
+            layout.nodes[uid].task.row = 0
+
+    # Place noncritical zone bands around the centered critical path.  Smaller
+    # zones remain above larger zones as requested, while packed chains retain
+    # a common row and therefore retain their bend reduction.
+    noncritical_rows_by_zone: dict[str, list[int]] = {}
+    for zone in zone_order:
+        rows = sorted({row_assignment[uid] for uid, node in layout.nodes.items() if uid not in critical_uids and node.task.zone == zone})
+        noncritical_rows_by_zone[zone] = rows
+    ordered_noncritical_rows = [
+        (zone, row)
+        for zone in zone_order
+        for row in noncritical_rows_by_zone[zone]
+    ]
+    split = (len(ordered_noncritical_rows) + 1) // 2
+    upper_rows = ordered_noncritical_rows[:split]
+    lower_rows = ordered_noncritical_rows[split:]
+    vertical_row: dict[int, int] = {}
+    for index, (_, old_row) in enumerate(upper_rows):
+        vertical_row[old_row] = len(upper_rows) - index
+    for index, (_, old_row) in enumerate(lower_rows):
+        vertical_row[old_row] = -(index + 1)
+
+    for uid, node in layout.nodes.items():
+        if uid in critical_uids:
+            continue
+        node.x = period_centers[task_period[uid]] - NODE_WIDTH / 2
+        node.task.row = vertical_row[row_assignment[uid]]
+        node.y = node.task.row * Y_SPACING
 
     layout.lane_ranges = {}
     for zone in zone_order:
-        zone_nodes = [node for node in layout.nodes.values() if node.task.zone == zone]
+        zone_nodes = [node for node in layout.nodes.values() if node.task.zone == zone and not node.task.critical]
         if zone_nodes:
             layout.lane_ranges[zone] = (
                 max(node.y for node in zone_nodes),
@@ -301,10 +362,11 @@ def enlarge_layout(layout: DrawingLayout, time_scale: str = "month") -> DrawingL
     }
 
     layout.time_axis = [] if scale == "none" else [
-        (period_label(period, scale), index * X_SPACING + NODE_WIDTH / 2)
-        for index, period in enumerate(periods)
+        (period_label(period, scale), period_centers[period])
+        for period in periods
     ]
     layout.time_axis_title = "" if scale == "none" else f"時間座標（{TIME_SCALE_TITLES[scale]}）"
+    layout.time_boundaries = [] if scale == "none" else boundaries
 
     layout.min_x = min(node.x for node in layout.nodes.values()) - 270.0
     layout.max_x = max(node.x for node in layout.nodes.values()) + NODE_WIDTH + 90.0
@@ -1054,15 +1116,14 @@ class EzdxfAonWriter:
         if self.layout.time_axis:
             axis_y = self.layout.max_y - 66
             centers = [x for _, x in self.layout.time_axis]
-            boundaries = [centers[0] - X_SPACING / 2]
-            boundaries.extend((left + right) / 2 for left, right in zip(centers, centers[1:]))
-            boundaries.append(centers[-1] + X_SPACING / 2)
+            boundaries = self.layout.time_boundaries
             self.text("AON_TITLE", self.layout.min_x + 6, axis_y + 16, 5.5, self.layout.time_axis_title, max_width=150.0)
             self.line("AON_LANE", boundaries[0], axis_y, boundaries[-1], axis_y)
             for boundary in boundaries:
                 self.line("AON_LANE", boundary, axis_y, boundary, self.layout.min_y + 12)
             for label, center_x in self.layout.time_axis:
                 self.text("AON_TITLE", center_x - 25, axis_y + 9, 5.2, label, max_width=50.0)
+        self.text("AON_TITLE", self.layout.min_x + 6, 10, 5.5, "要徑（中央水平帶）", max_width=180.0)
         for zone, (top, bottom) in self.layout.lane_ranges.items():
             self.text("AON_TITLE", self.layout.min_x + 6, top - 9, 5.5, zone, max_width=230.0)
             self.line("AON_LANE", self.layout.min_x + 2, top + 18, self.layout.max_x - 2, top + 18)
