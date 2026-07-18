@@ -915,6 +915,8 @@ class EzdxfAonWriter:
         target_dogleg_links = 0
         detour_links = 0
         relaxed_detour_links = 0
+        emergency_detour_links = 0
+        forced_detour_links = 0
         for link in sorted(routed_links, key=lambda item: item.index):
             geometry = base[link.index]
             start = (float(geometry["start"][0]), float(geometry["start"][1]))
@@ -1000,7 +1002,58 @@ class EzdxfAonWriter:
                         if selected_points is not None:
                             break
                 if selected_points is None:
-                    raise RuntimeError(f"No node-clear route for link {link.index}")
+                    # Search the clear outer frame above and below the entire
+                    # network.  Source and target trunks are filtered
+                    # independently before combining them, keeping this rare
+                    # fallback both reliable and reasonably fast.
+                    node_top = max(node.y for node in self.layout.nodes.values())
+                    node_bottom = min(node.y - NODE_HEIGHT for node in self.layout.nodes.values())
+                    outside_levels = (node_top + 2 * Y_SPACING, node_bottom - 2 * Y_SPACING)
+
+                    def corridor_candidates(origin: float) -> list[float]:
+                        values = [origin]
+                        for step in range(1, 121):
+                            values.extend((origin + step * MIN_VERTICAL_CHANNEL_SPACING, origin - step * MIN_VERTICAL_CHANNEL_SPACING))
+                        return values
+
+                    for outside_y in outside_levels:
+                        source_candidates = []
+                        for source_x in corridor_candidates(source_x0):
+                            partial = simplify_points([start, (source_x, start[1]), (source_x, outside_y)])
+                            if not path_hits_node(link, partial):
+                                source_candidates.append(source_x)
+                                if len(source_candidates) >= 12:
+                                    break
+                        target_candidates = []
+                        for target_x in corridor_candidates(target_x0):
+                            partial = simplify_points([(target_x, outside_y), (target_x, arrow_base[1]), arrow_base])
+                            if not path_hits_node(link, partial):
+                                target_candidates.append(target_x)
+                                if len(target_candidates) >= 12:
+                                    break
+                        combinations = sorted(
+                            ((abs(source_x - target_x), source_x, target_x) for source_x in source_candidates for target_x in target_candidates),
+                            key=lambda item: item[0],
+                        )
+                        for _, source_x, target_x in combinations:
+                            candidate = simplify_points(
+                                [start, (source_x, start[1]), (source_x, outside_y), (target_x, outside_y), (target_x, arrow_base[1]), arrow_base]
+                            )
+                            if not path_hits_node(link, candidate):
+                                selected_points = candidate
+                                emergency_detour_links += 1
+                                break
+                        if selected_points is not None:
+                            break
+                if selected_points is None:
+                    # Absolute last resort: preserve a valid relationship
+                    # object and complete the drawing instead of aborting the
+                    # whole conversion because of one unusually dense link.
+                    outside_y = max(node.y for node in self.layout.nodes.values()) + 3 * Y_SPACING
+                    selected_points = simplify_points(
+                        [start, (source_x0, start[1]), (source_x0, outside_y), (target_x0, outside_y), (target_x0, arrow_base[1]), arrow_base]
+                    )
+                    forced_detour_links += 1
                 route_mode = "detour"
                 detour_links += 1
 
@@ -1018,6 +1071,8 @@ class EzdxfAonWriter:
             "target_dogleg_links": target_dogleg_links,
             "four_turn_links": detour_links,
             "relaxed_detour_links": relaxed_detour_links,
+            "emergency_detour_links": emergency_detour_links,
+            "forced_detour_links": forced_detour_links,
             "upper_channel_links": sum(
                 int(base[link.index].get("channel_direction", 0)) > 0
                 and geometry_by_link[link.index].get("route_mode") == "detour"
