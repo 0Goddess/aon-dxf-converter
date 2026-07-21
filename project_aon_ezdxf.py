@@ -55,6 +55,11 @@ ARROW_LENGTH = 4.8
 ARROW_HALF_HEIGHT = 3.1
 MIN_VERTICAL_CHANNEL_SPACING = 14.0
 MIN_HORIZONTAL_CHANNEL_SPACING = 9.0
+# Every routed relationship must visibly leave and enter a work node through a
+# horizontal stub.  Measure the target stub from the arrow base (not its tip),
+# otherwise the arrow length consumes almost the entire apparent clearance.
+MIN_ENDPOINT_STUB_LENGTH = 28.0
+ENDPOINT_CHANNEL_STEP = 14.0
 
 
 TIME_SCALE_TITLES = {"week": "週", "month": "月", "quarter": "季", "year": "年"}
@@ -820,8 +825,33 @@ class EzdxfAonWriter:
                 for index in range(pool_count)
             ]
             if reserved:
-                pool.sort(key=lambda level: min(abs(level - value) for value in reserved), reverse=True)
-                pool = sorted(pool[:count], reverse=True)
+                # Direct relationships already occupy fixed elevations.  Take
+                # the closest pool slot out for each reserved level, then map
+                # the remaining slots top-to-bottom by the counterpart node's
+                # y-position.  This makes lower successors leave through lower
+                # ports instead of crossing an upper/direct relationship.
+                available = list(pool)
+                average_counterpart_y = sum(item[2] for item in endpoints) / max(1, len(endpoints))
+                prefer_upper_ports = average_counterpart_y > node_top + 1e-6
+                prefer_lower_ports = average_counterpart_y < node_top - NODE_HEIGHT - 1e-6
+                for value in sorted(reserved, reverse=True):
+                    if available:
+                        if prefer_upper_ports:
+                            # Reserve the lower equidistant slot so upper
+                            # successors retain the higher source port.
+                            tie_break = lambda level: level
+                        elif prefer_lower_ports:
+                            # Reserve the higher equidistant slot so lower
+                            # successors retain the lower source port.
+                            tie_break = lambda level: -level
+                        else:
+                            tie_break = lambda level: -level
+                        closest = min(
+                            available,
+                            key=lambda level: (abs(level - value), tie_break(level)),
+                        )
+                        available.remove(closest)
+                pool = sorted(available[:count], reverse=True)
             for slot, ((link_index, role, _), level) in enumerate(zip(ordered, pool)):
                 # Nearby nodes often generate identical port elevations.  A
                 # small deterministic offset prevents unrelated endpoint
@@ -845,8 +875,14 @@ class EzdxfAonWriter:
             base_x = tx - arrow_direction * ARROW_LENGTH
 
             source_count = port_count[(link.index, "pred")]
-            source_spacing = min(12.0, 84.0 / max(1, source_count - 1))
-            source_offset = 10.0 + port_slot[(link.index, "pred")] * source_spacing
+            source_spacing = min(
+                ENDPOINT_CHANNEL_STEP,
+                98.0 / max(1, source_count - 1),
+            )
+            source_offset = (
+                MIN_ENDPOINT_STUB_LENGTH
+                + port_slot[(link.index, "pred")] * source_spacing
+            )
             source_bend_x = sx + source_offset * (1 if source_side == "R" else -1)
             channel_direction = -1 if succ.y <= pred.y else 1
             base[link.index] = {
@@ -964,12 +1000,15 @@ class EzdxfAonWriter:
         for link in routed_links:
             geometry = base[link.index]
             count = target_lane_count[link.index]
-            available_width = X_SPACING - NODE_WIDTH - 20.0
-            spacing = min(8.0, available_width / max(1, count - 1))
-            offset = 8.0 + target_lane[link.index] * spacing
-            target_x = float(geometry["tip"][0])
+            available_width = X_SPACING - NODE_WIDTH - 2.0 * MIN_ENDPOINT_STUB_LENGTH
+            spacing = min(
+                ENDPOINT_CHANNEL_STEP,
+                max(4.0, available_width / max(1, count - 1)),
+            )
+            offset = MIN_ENDPOINT_STUB_LENGTH + target_lane[link.index] * spacing
+            arrow_base_x = float(geometry["base"][0])
             direction = int(geometry["arrow_direction"])
-            geometry["target_bend_x"] = target_x - direction * offset
+            geometry["target_bend_x"] = arrow_base_x - direction * offset
 
         # Prefer the two-turn routing shown in the user's reference:
         # horizontal out of the source, one vertical trunk, then horizontal
@@ -1014,6 +1053,23 @@ class EzdxfAonWriter:
                     and math.isclose(first[1], second[1], abs_tol=1e-6)
                 )
             ]
+
+        def respects_endpoint_stubs(points: list[tuple[float, float]]) -> bool:
+            """Keep vertical channels visibly clear of both endpoint nodes."""
+            segments = orthogonal_segments(points)
+            if not segments:
+                return False
+            first, last = segments[0], segments[-1]
+            first_horizontal = math.isclose(first[0][1], first[1][1], abs_tol=1e-6)
+            last_horizontal = math.isclose(last[0][1], last[1][1], abs_tol=1e-6)
+            if not first_horizontal or not last_horizontal:
+                return False
+            first_length = abs(first[1][0] - first[0][0])
+            last_length = abs(last[1][0] - last[0][0])
+            return (
+                first_length >= MIN_ENDPOINT_STUB_LENGTH - 1e-6
+                and last_length >= MIN_ENDPOINT_STUB_LENGTH - 1e-6
+            )
 
         def enters_endpoint_node(
             segment: tuple[tuple[float, float], tuple[float, float]], node: DrawingNode
@@ -1082,7 +1138,11 @@ class EzdxfAonWriter:
                     allocated_horizontals.append((y1, low, high))
 
         def path_is_clear(link: Link, points: list[tuple[float, float]]) -> bool:
-            return not path_hits_node(link, points) and path_has_channel_clearance(points)
+            return (
+                respects_endpoint_stubs(points)
+                and not path_hits_node(link, points)
+                and path_has_channel_clearance(points)
+            )
 
         def label_position(points: list[tuple[float, float]]) -> tuple[float, float]:
             horizontal = [
@@ -1300,6 +1360,9 @@ class EzdxfAonWriter:
         # remaining collinear segment onto a unique outer lane.
         accepted_segments: list[tuple[tuple[float, float], tuple[float, float]]] = []
         accepted_all_segments: list[tuple[tuple[float, float], tuple[float, float]]] = []
+        accepted_link_segments: list[
+            tuple[int, tuple[tuple[float, float], tuple[float, float]]]
+        ] = []
         deoverlap_links = 0
         node_avoidance_links = 0
         link_by_index = {link.index: link for link in self.layout.links}
@@ -1352,6 +1415,39 @@ class EzdxfAonWriter:
                 v1[0], h2[0], abs_tol=1e-6
             )
             return at_vertical_end or at_horizontal_end
+
+        def proper_crossing_point(
+            first: tuple[tuple[float, float], tuple[float, float]],
+            second: tuple[tuple[float, float], tuple[float, float]],
+        ) -> tuple[float, float] | None:
+            """Return the point of an interior orthogonal X crossing."""
+            (a, b), (c, d) = first, second
+            first_vertical = math.isclose(a[0], b[0], abs_tol=1e-6)
+            second_vertical = math.isclose(c[0], d[0], abs_tol=1e-6)
+            if first_vertical == second_vertical:
+                return None
+            vertical, horizontal = (first, second) if first_vertical else (second, first)
+            (v1, v2), (h1, h2) = vertical, horizontal
+            if (
+                min(h1[0], h2[0]) + 1e-6 < v1[0] < max(h1[0], h2[0]) - 1e-6
+                and min(v1[1], v2[1]) + 1e-6 < h1[1] < max(v1[1], v2[1]) - 1e-6
+            ):
+                return (v1[0], h1[1])
+            return None
+
+        def properly_crosses(
+            first: tuple[tuple[float, float], tuple[float, float]],
+            second: tuple[tuple[float, float], tuple[float, float]],
+        ) -> bool:
+            return proper_crossing_point(first, second) is not None
+
+        def crosses_same_source(link: Link, points: list[tuple[float, float]]) -> bool:
+            # Port ordering already separates the source fan-out.  Do not turn
+            # a remaining clean X crossing into a hard routing failure: dense
+            # networks can have no alternative once node and no-touch rules
+            # are applied.  Crossings remain a route-order preference rather
+            # than an absolute feasibility condition.
+            return False
 
         def touches_accepted(points: list[tuple[float, float]]) -> bool:
             segments = orthogonal_segments(points)
@@ -1421,7 +1517,10 @@ class EzdxfAonWriter:
         # bends that do not avoid any work node.
         for link_index, geometry in geometry_by_link.items():
             link = link_by_index[link_index]
-            simplified = remove_unnecessary_detours(link, list(geometry["points"]))
+            original = list(geometry["points"])
+            simplified = remove_unnecessary_detours(link, original)
+            if not bool(geometry.get("direct")) and not respects_endpoint_stubs(simplified):
+                simplified = original
             geometry["points"] = simplified
             geometry["label_position"] = label_position(simplified)
 
@@ -1450,7 +1549,16 @@ class EzdxfAonWriter:
             points = list(geometry["points"])
             link = link_by_index[link_index]
             hits_node = path_hits_node(link, points)
-            if hits_node or overlaps_accepted(points):
+            bad_endpoint_stubs = (
+                not bool(geometry.get("direct"))
+                and not respects_endpoint_stubs(points)
+            )
+            if (
+                hits_node
+                or bad_endpoint_stubs
+                or overlaps_accepted(points)
+                or crosses_same_source(link, points)
+            ):
                 start = (float(geometry["start"][0]), float(geometry["start"][1]))
                 arrow_base = (float(geometry["base"][0]), float(geometry["base"][1]))
                 source_shift = 1 if geometry.get("source_side", "R") == "R" else -1
@@ -1468,7 +1576,7 @@ class EzdxfAonWriter:
                     candidate = simplify_points(
                         [start, (trunk_x, start[1]), (trunk_x, arrow_base[1]), arrow_base]
                     )
-                    if not path_hits_node(link, candidate) and not overlaps_accepted(candidate):
+                    if respects_endpoint_stubs(candidate) and not path_hits_node(link, candidate) and not overlaps_accepted(candidate) and not crosses_same_source(link, candidate):
                         chosen = candidate
                         break
 
@@ -1501,7 +1609,7 @@ class EzdxfAonWriter:
                             arrow_base,
                         ]
                     )
-                    if not path_hits_node(link, candidate) and not overlaps_accepted(candidate):
+                    if respects_endpoint_stubs(candidate) and not path_hits_node(link, candidate) and not overlaps_accepted(candidate) and not crosses_same_source(link, candidate):
                         chosen = candidate
                         break
 
@@ -1514,8 +1622,12 @@ class EzdxfAonWriter:
                     side = -1 if arrow_base[1] <= start[1] else 1
                     local_edge = min(start[1], arrow_base[1]) - NODE_HEIGHT if side < 0 else max(start[1], arrow_base[1])
                     outside_y = local_edge + side * (14.0 + slot * MIN_HORIZONTAL_CHANNEL_SPACING)
-                    source_exit_x = start[0] + source_shift * (3.0 + attempt * 15.0)
-                    target_exit_x = arrow_base[0] + target_shift * (3.0 + attempt * 15.0)
+                    source_exit_x = start[0] + source_shift * (
+                        MIN_ENDPOINT_STUB_LENGTH + (attempt - 1) * 15.0
+                    )
+                    target_exit_x = arrow_base[0] + target_shift * (
+                        MIN_ENDPOINT_STUB_LENGTH + (attempt - 1) * 15.0
+                    )
                     source_lane_y = start[1] + side * (5.0 + slot * 11.0)
                     target_lane_y = arrow_base[1] + side * (5.0 + slot * 11.0)
                     source_outer_x = source_exit_x + source_shift * (8.0 + slot * 16.0)
@@ -1534,7 +1646,7 @@ class EzdxfAonWriter:
                             arrow_base,
                         ]
                     )
-                    if not path_hits_node(link, candidate) and not overlaps_accepted(candidate):
+                    if respects_endpoint_stubs(candidate) and not path_hits_node(link, candidate) and not overlaps_accepted(candidate) and not crosses_same_source(link, candidate):
                         chosen = candidate
                         break
                 if chosen is None:
@@ -1562,7 +1674,7 @@ class EzdxfAonWriter:
                                 arrow_base,
                             ]
                         )
-                        if not path_hits_node(link, candidate) and not touches_accepted(candidate):
+                        if respects_endpoint_stubs(candidate) and not path_hits_node(link, candidate) and not touches_accepted(candidate) and not crosses_same_source(link, candidate):
                             chosen = candidate
                             break
                 if chosen is None:
@@ -1613,7 +1725,7 @@ class EzdxfAonWriter:
                                         arrow_base,
                                     ]
                                 )
-                                if not path_hits_node(link, candidate) and not touches_accepted(candidate):
+                                if respects_endpoint_stubs(candidate) and not path_hits_node(link, candidate) and not touches_accepted(candidate) and not crosses_same_source(link, candidate):
                                     chosen = candidate
                                     break
                             if chosen is not None:
@@ -1622,7 +1734,7 @@ class EzdxfAonWriter:
                             break
                 if chosen is not None:
                     shortened = remove_unnecessary_detours(link, chosen)
-                    if not path_hits_node(link, shortened) and not overlaps_accepted(shortened):
+                    if respects_endpoint_stubs(shortened) and not path_hits_node(link, shortened) and not overlaps_accepted(shortened):
                         chosen = shortened
                     points = chosen
                     geometry["points"] = points
@@ -1636,6 +1748,9 @@ class EzdxfAonWriter:
             segments = orthogonal_segments(points)
             accepted_segments.extend(segments[1:-1] if len(segments) > 2 else segments)
             accepted_all_segments.extend(segments)
+            accepted_link_segments.extend(
+                (link.pred_uid, segment) for segment in segments[:2]
+            )
 
         def path_self_intersects(points: list[tuple[float, float]]) -> bool:
             segments = orthogonal_segments(points)
@@ -1684,6 +1799,15 @@ class EzdxfAonWriter:
                 if other_index != link_index
                 for segment in orthogonal_segments(list(other_geometry["points"]))
             ]
+            same_source_other_segments = [
+                segment
+                for other_index, other_geometry in geometry_by_link.items()
+                if (
+                    other_index != link_index
+                    and link_by_index[other_index].pred_uid == link.pred_uid
+                )
+                for segment in orthogonal_segments(list(other_geometry["points"]))[:2]
+            ]
             raw_candidates: list[list[tuple[float, float]]] = []
             for start_index in range(len(current) - 2):
                 for end_index in range(start_index + 2, len(current)):
@@ -1712,7 +1836,11 @@ class EzdxfAonWriter:
                 )
             )
             for candidate in raw_candidates[:24]:
-                if path_hits_node(link, candidate) or path_self_intersects(candidate):
+                if (
+                    (not bool(geometry.get("direct")) and not respects_endpoint_stubs(candidate))
+                    or path_hits_node(link, candidate)
+                    or path_self_intersects(candidate)
+                ):
                     continue
                 candidate_segments = orthogonal_segments(candidate)
                 if any(
