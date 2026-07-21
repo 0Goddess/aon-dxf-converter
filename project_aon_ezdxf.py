@@ -354,14 +354,75 @@ def enlarge_layout(layout: DrawingLayout, time_scale: str = "month") -> DrawingL
             noncritical_rows_by_zone[zone].sort(
                 key=lambda row: (-barycenter(row), len(row_members[row]), min(layout.nodes[uid].task.task_id for uid in row_members[row]))
             )
-    ordered_noncritical_rows = [
-        (zone, row)
-        for zone in zone_order
-        for row in noncritical_rows_by_zone[zone]
-    ]
+    ordered_noncritical_rows = sorted(
+        [
+            (zone, row)
+            for zone in zone_order
+            for row in noncritical_rows_by_zone[zone]
+        ],
+        key=lambda item: (
+            len(row_members[item[1]]),
+            min(task_dates(layout.nodes[uid].task)[0] for uid in row_members[item[1]]),
+            min(layout.nodes[uid].task.task_id for uid in row_members[item[1]]),
+        ),
+    )
     split = (len(ordered_noncritical_rows) + 1) // 2
     upper_rows = ordered_noncritical_rows[:split]
     lower_rows = ordered_noncritical_rows[split:]
+
+    # Preserve the requested upper/lower capacity while swapping complete
+    # packed rows to keep directly related operations on the same side of the
+    # critical path.  This prevents an upper predecessor from sending a very
+    # long branch to an otherwise movable operation at the bottom.
+    row_edges: collections.Counter[tuple[int, int]] = collections.Counter()
+    for link in layout.links:
+        if link.pred_uid in critical_uids or link.succ_uid in critical_uids:
+            continue
+        first = row_assignment[link.pred_uid]
+        second = row_assignment[link.succ_uid]
+        if first == second:
+            continue
+        row_edges[tuple(sorted((first, second)))] += 1
+
+    side = {row: 1 for _, row in upper_rows}
+    side.update({row: -1 for _, row in lower_rows})
+
+    def side_score(candidate: dict[int, int]) -> int:
+        cut_cost = sum(
+            weight
+            for (first, second), weight in row_edges.items()
+            if candidate[first] != candidate[second]
+        )
+        upper_activity_count = sum(
+            len(row_members[row]) for row, value in candidate.items() if value > 0
+        )
+        return cut_cost * 100 + upper_activity_count
+
+    current_score = side_score(side)
+    for _ in range(80):
+        best: tuple[int, int, int] | None = None
+        for upper_row in [row for row, value in side.items() if value > 0]:
+            for lower_row in [row for row, value in side.items() if value < 0]:
+                side[upper_row], side[lower_row] = -1, 1
+                score = side_score(side)
+                side[upper_row], side[lower_row] = 1, -1
+                if score < current_score and (best is None or score < best[0]):
+                    best = (score, upper_row, lower_row)
+        if best is None:
+            break
+        current_score, upper_row, lower_row = best
+        side[upper_row], side[lower_row] = -1, 1
+
+    order_index = {row: index for index, (_, row) in enumerate(ordered_noncritical_rows)}
+    row_zone = {row: zone for zone, row in ordered_noncritical_rows}
+    upper_rows = sorted(
+        [(row_zone[row], row) for row, value in side.items() if value > 0],
+        key=lambda item: order_index[item[1]],
+    )
+    lower_rows = sorted(
+        [(row_zone[row], row) for row, value in side.items() if value < 0],
+        key=lambda item: order_index[item[1]],
+    )
     vertical_row: dict[int, int] = {}
     for index, (_, old_row) in enumerate(upper_rows):
         vertical_row[old_row] = len(upper_rows) - index
@@ -374,6 +435,65 @@ def enlarge_layout(layout: DrawingLayout, time_scale: str = "month") -> DrawingL
         node.x = period_centers[task_period[uid]] - NODE_WIDTH / 2
         node.task.row = vertical_row[row_assignment[uid]]
         node.y = node.task.row * Y_SPACING
+
+    # Individual branch nodes may still land on the opposite side from all of
+    # their dependencies because row packing works on whole chains.  Allow a
+    # node to use a free row on the other side when that materially shortens
+    # its incident relationships.  The critical row remains reserved.
+    incident: dict[int, list[int]] = collections.defaultdict(list)
+    predecessors: dict[int, list[int]] = collections.defaultdict(list)
+    successors: dict[int, list[int]] = collections.defaultdict(list)
+    for link in layout.links:
+        incident[link.pred_uid].append(link.succ_uid)
+        incident[link.succ_uid].append(link.pred_uid)
+        predecessors[link.succ_uid].append(link.pred_uid)
+        successors[link.pred_uid].append(link.succ_uid)
+    occupied = {
+        (round(node.x, 6), node.task.row): uid
+        for uid, node in layout.nodes.items()
+    }
+    max_side_row = max(abs(node.task.row) for node in layout.nodes.values())
+    for _ in range(3):
+        moved = False
+        for uid, node in sorted(
+            layout.nodes.items(),
+            key=lambda item: (-item[1].task.rank, -len(incident.get(item[0], [])), item[1].task.task_id),
+        ):
+            if uid in critical_uids or not predecessors.get(uid) or node.task.row == 0:
+                continue
+            weighted_neighbors = [
+                (layout.nodes[other], 3.0) for other in predecessors[uid]
+            ] + [
+                (layout.nodes[other], 1.0) for other in successors.get(uid, [])
+            ]
+            current_cost = sum(
+                weight * abs(node.y - other.y) for other, weight in weighted_neighbors
+            ) + abs(node.y) * 0.08
+            opposite_sign = -1 if node.task.row > 0 else 1
+            candidates: list[tuple[float, int]] = []
+            for magnitude in range(1, max_side_row + 1):
+                candidate_row = opposite_sign * magnitude
+                owner = occupied.get((round(node.x, 6), candidate_row))
+                if owner is not None and owner != uid:
+                    continue
+                candidate_y = candidate_row * Y_SPACING
+                cost = sum(
+                    weight * abs(candidate_y - other.y)
+                    for other, weight in weighted_neighbors
+                ) + abs(candidate_y) * 0.08
+                candidates.append((cost, candidate_row))
+            if not candidates:
+                continue
+            best_cost, best_row = min(candidates)
+            if best_cost > current_cost - Y_SPACING:
+                continue
+            occupied.pop((round(node.x, 6), node.task.row), None)
+            node.task.row = best_row
+            node.y = best_row * Y_SPACING
+            occupied[(round(node.x, 6), best_row)] = uid
+            moved = True
+        if not moved:
+            break
 
     layout.lane_ranges = {}
     for zone in zone_order:
@@ -1232,9 +1352,59 @@ class EzdxfAonWriter:
 
             return touches_accepted(points)
 
+        def remove_unnecessary_detours(
+            link: Link, points: list[tuple[float, float]]
+        ) -> list[tuple[float, float]]:
+            """Remove node-unnecessary U-turns and repeated orthogonal bends."""
+            current = simplify_points(points)
+            while len(current) > 2:
+                replacement = None
+                for gap in range(len(current) - 1, 1, -1):
+                    for start_index in range(0, len(current) - gap):
+                        end_index = start_index + gap
+                        first = current[start_index]
+                        last = current[end_index]
+                        aligned = math.isclose(first[0], last[0], abs_tol=1e-6) or math.isclose(
+                            first[1], last[1], abs_tol=1e-6
+                        )
+                        if not aligned:
+                            continue
+                        candidate = simplify_points(
+                            current[: start_index + 1]
+                            + [last]
+                            + current[end_index + 1 :]
+                        )
+                        if len(candidate) >= len(current) or path_hits_node(link, candidate):
+                            continue
+                        replacement = candidate
+                        if replacement is not None:
+                            break
+                    if replacement is not None:
+                        break
+                if replacement is None:
+                    break
+                current = replacement
+            return current
+
+        # Simplify each relationship before resolving conflicts with other
+        # relationships.  This removes self-returning U shapes and staircase
+        # bends that do not avoid any work node.
+        for link_index, geometry in geometry_by_link.items():
+            link = link_by_index[link_index]
+            simplified = remove_unnecessary_detours(link, list(geometry["points"]))
+            geometry["points"] = simplified
+            geometry["label_position"] = label_position(simplified)
+
         final_order = sorted(
             geometry_by_link,
             key=lambda index: (
+                0 if bool(geometry_by_link[index].get("direct")) else 1,
+                0
+                if (
+                    self.layout.nodes[link_by_index[index].pred_uid].task.critical
+                    or self.layout.nodes[link_by_index[index].succ_uid].task.critical
+                )
+                else 1,
                 0
                 if path_hits_node(link_by_index[index], list(geometry_by_link[index]["points"]))
                 else 1,
@@ -1421,6 +1591,9 @@ class EzdxfAonWriter:
                         if chosen is not None:
                             break
                 if chosen is not None:
+                    shortened = remove_unnecessary_detours(link, chosen)
+                    if not path_hits_node(link, shortened) and not overlaps_accepted(shortened):
+                        chosen = shortened
                     points = chosen
                     geometry["points"] = points
                     geometry["label_position"] = label_position(points)
@@ -1434,6 +1607,96 @@ class EzdxfAonWriter:
             accepted_segments.extend(segments[1:-1] if len(segments) > 2 else segments)
             accepted_all_segments.extend(segments)
 
+        def path_self_intersects(points: list[tuple[float, float]]) -> bool:
+            segments = orthogonal_segments(points)
+            for first_index, first in enumerate(segments):
+                for second_index in range(first_index + 2, len(segments)):
+                    # The first and last segments of an open polyline are not
+                    # adjacent; any meeting between them is also a loop.
+                    second = segments[second_index]
+                    (a, b), (c, d) = first, second
+                    first_vertical = math.isclose(a[0], b[0], abs_tol=1e-6)
+                    second_vertical = math.isclose(c[0], d[0], abs_tol=1e-6)
+                    if first_vertical and second_vertical:
+                        if math.isclose(a[0], c[0], abs_tol=1e-6) and spans_overlap(
+                            a[1], b[1], c[1], d[1]
+                        ):
+                            return True
+                    elif not first_vertical and not second_vertical:
+                        if math.isclose(a[1], c[1], abs_tol=1e-6) and spans_overlap(
+                            a[0], b[0], c[0], d[0]
+                        ):
+                            return True
+                    else:
+                        vertical, horizontal = (first, second) if first_vertical else (second, first)
+                        (v1, v2), (h1, h2) = vertical, horizontal
+                        if (
+                            min(h1[0], h2[0]) - 1e-6 <= v1[0] <= max(h1[0], h2[0]) + 1e-6
+                            and min(v1[1], v2[1]) - 1e-6 <= h1[1] <= max(v1[1], v2[1]) + 1e-6
+                        ):
+                            return True
+            return False
+
+        # Post-route corner reduction.  At this stage every relationship has
+        # a valid path, so an L/direct shortcut is accepted only when it keeps
+        # node clearance, removes self-loops, and remains physically separate
+        # from every other relationship.
+        post_simplified_links = 0
+        for link_index in sorted(geometry_by_link):
+            geometry = geometry_by_link[link_index]
+            current = list(geometry["points"])
+            if len(current) <= 2:
+                continue
+            link = link_by_index[link_index]
+            other_segments = [
+                segment
+                for other_index, other_geometry in geometry_by_link.items()
+                if other_index != link_index
+                for segment in orthogonal_segments(list(other_geometry["points"]))
+            ]
+            raw_candidates: list[list[tuple[float, float]]] = []
+            for start_index in range(len(current) - 2):
+                for end_index in range(start_index + 2, len(current)):
+                    first = current[start_index]
+                    last = current[end_index]
+                    bridges = [[last]] if (
+                        math.isclose(first[0], last[0], abs_tol=1e-6)
+                        or math.isclose(first[1], last[1], abs_tol=1e-6)
+                    ) else [
+                        [(last[0], first[1]), last],
+                        [(first[0], last[1]), last],
+                    ]
+                    for bridge in bridges:
+                        candidate = simplify_points(
+                            current[: start_index + 1] + bridge + current[end_index + 1 :]
+                        )
+                        if len(candidate) < len(current):
+                            raw_candidates.append(candidate)
+            raw_candidates.sort(
+                key=lambda candidate: (
+                    len(candidate),
+                    sum(
+                        abs(second[0] - first[0]) + abs(second[1] - first[1])
+                        for first, second in zip(candidate, candidate[1:])
+                    ),
+                )
+            )
+            for candidate in raw_candidates[:24]:
+                if path_hits_node(link, candidate) or path_self_intersects(candidate):
+                    continue
+                candidate_segments = orthogonal_segments(candidate)
+                if any(
+                    physically_touches(segment, other)
+                    for segment in candidate_segments
+                    for other in other_segments
+                ):
+                    continue
+                current = candidate
+                geometry["points"] = current
+                geometry["label_position"] = label_position(current)
+                post_simplified_links += 1
+                break
+
         return geometry_by_link, {
             "direct_links": len(direct_geometry),
             "routed_links": len(routed_links),
@@ -1446,6 +1709,7 @@ class EzdxfAonWriter:
             "forced_detour_links": forced_detour_links,
             "deoverlap_links": deoverlap_links,
             "node_avoidance_links": node_avoidance_links,
+            "post_simplified_links": post_simplified_links,
             "upper_channel_links": sum(
                 int(base[link.index].get("channel_direction", 0)) > 0
                 and geometry_by_link[link.index].get("route_mode") == "detour"
