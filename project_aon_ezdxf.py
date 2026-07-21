@@ -673,7 +673,12 @@ class EzdxfAonWriter:
                 pool.sort(key=lambda level: min(abs(level - value) for value in reserved), reverse=True)
                 pool = sorted(pool[:count], reverse=True)
             for slot, ((link_index, role, _), level) in enumerate(zip(ordered, pool)):
-                port_y[(link_index, role)] = level
+                # Nearby nodes often generate identical port elevations.  A
+                # small deterministic offset prevents unrelated endpoint
+                # stubs from appearing to join while remaining visually
+                # aligned inside the same node compartment.
+                jitter = ((((link_index + 1) * 613) % 997) / 996.0 - 0.5) * 1.8
+                port_y[(link_index, role)] = level + jitter
                 port_slot[(link_index, role)] = slot
                 port_count[(link_index, role)] = count
 
@@ -706,9 +711,10 @@ class EzdxfAonWriter:
                 "direct": False,
             }
 
-        # Balance complex links between the upper and lower gaps of each row.
-        # The choice minimizes concurrent interval lanes; ties retain the
-        # natural target direction and then prefer the lower channel.
+        # Keep vertically separated dependencies on the side of their target:
+        # a lower successor must leave through the lower channel and an upper
+        # successor through the upper channel.  Only same-row links are
+        # balanced between both sides to reduce congestion.
         routed_by_row: dict[float, list[Link]] = collections.defaultdict(list)
         for link in routed_links:
             routed_by_row[round(self.layout.nodes[link.pred_uid].y, 6)].append(link)
@@ -730,6 +736,15 @@ class EzdxfAonWriter:
                     float(geometry["tip"][0]),
                 )
                 natural = int(geometry["channel_direction"])
+                pred_y = self.layout.nodes[link.pred_uid].y
+                succ_y = self.layout.nodes[link.succ_uid].y
+                if not math.isclose(pred_y, succ_y, abs_tol=1e-6):
+                    geometry["channel_direction"] = natural
+                    side_items[natural].append(item)
+                    _, side_counts[natural] = assign_interval_lanes(
+                        side_items[natural], clearance=3.0
+                    )
+                    continue
                 choices: list[tuple[tuple[int, int, int, int], int, int]] = []
                 for direction in (-1, 1):
                     _, candidate_count = assign_interval_lanes(side_items[direction] + [item], clearance=3.0)
@@ -1041,7 +1056,13 @@ class EzdxfAonWriter:
                     node_top = max(node.y for node in self.layout.nodes.values())
                     node_bottom = min(node.y - NODE_HEIGHT for node in self.layout.nodes.values())
                     lane_offset = (2 + emergency_detour_links) * Y_SPACING
-                    outside_levels = (node_top + lane_offset, node_bottom - lane_offset)
+                    upper_outside = node_top + lane_offset
+                    lower_outside = node_bottom - lane_offset
+                    outside_levels = (
+                        (lower_outside,)
+                        if int(geometry["channel_direction"]) < 0
+                        else (upper_outside,)
+                    )
 
                     def corridor_candidates(origin: float) -> list[float]:
                         values = [origin]
@@ -1083,16 +1104,23 @@ class EzdxfAonWriter:
                     # object and complete the drawing instead of aborting the
                     # whole conversion because of one unusually dense link.
                     forced_slot = forced_detour_links + 1
+                    route_jitter = ((link.index + 1) * 0.017) % 1.0
                     # Keep endpoint stubs short; the endpoint port and unique
                     # outer Y lane provide separation without long overlaps.
-                    forced_source_x = source_x0 + source_shift * forced_slot * 2.5
-                    forced_target_x = target_x0 + target_shift * forced_slot * 2.5
-                    outside_y = max(node.y for node in self.layout.nodes.values()) + (3 + forced_slot) * Y_SPACING
+                    forced_source_x = source_x0 + source_shift * (forced_slot * 2.5 + route_jitter)
+                    forced_target_x = target_x0 + target_shift * (forced_slot * 2.5 + route_jitter)
                     lane_sign = 1 if int(geometry["channel_direction"]) > 0 else -1
-                    source_lane_y = start[1] + lane_sign * forced_slot * 1.37
-                    target_lane_y = arrow_base[1] + lane_sign * forced_slot * 1.37
-                    source_port_x = source_x0 + source_shift * forced_slot * 0.41
-                    target_port_x = target_x0 + target_shift * forced_slot * 0.41
+                    if lane_sign < 0:
+                        outside_y = min(start[1], arrow_base[1]) - NODE_HEIGHT - (2 + forced_slot) * 12.0 - route_jitter
+                    else:
+                        outside_y = max(start[1], arrow_base[1]) + (2 + forced_slot) * 12.0 + route_jitter
+                    source_lane_y = start[1] + lane_sign * (forced_slot * 1.37 + route_jitter)
+                    target_lane_y = arrow_base[1] + lane_sign * (forced_slot * 1.37 + route_jitter)
+                    # Keep the first/last stubs short so a relationship does
+                    # not run along the port level of an unrelated nearby
+                    # node before turning into its private lane.
+                    source_port_x = start[0] + source_shift * (4.0 + route_jitter)
+                    target_port_x = arrow_base[0] + target_shift * (4.0 + route_jitter)
                     selected_points = simplify_points(
                         [
                             start,
@@ -1121,7 +1149,9 @@ class EzdxfAonWriter:
         # always see a later emergency path from another zone.  Re-route any
         # remaining collinear segment onto a unique outer lane.
         accepted_segments: list[tuple[tuple[float, float], tuple[float, float]]] = []
+        accepted_all_segments: list[tuple[tuple[float, float], tuple[float, float]]] = []
         deoverlap_links = 0
+        node_avoidance_links = 0
         link_by_index = {link.index: link for link in self.layout.links}
         node_top = max(node.y for node in self.layout.nodes.values())
         node_bottom = min(node.y - NODE_HEIGHT for node in self.layout.nodes.values())
@@ -1141,33 +1171,149 @@ class EzdxfAonWriter:
                 return abs(a[1] - c[1]) < MIN_HORIZONTAL_CHANNEL_SPACING and spans_overlap(a[0], b[0], c[0], d[0])
             return False
 
+        def physically_touches(
+            first: tuple[tuple[float, float], tuple[float, float]],
+            second: tuple[tuple[float, float], tuple[float, float]],
+        ) -> bool:
+            (a, b), (c, d) = first, second
+            first_vertical = math.isclose(a[0], b[0], abs_tol=1e-6)
+            second_vertical = math.isclose(c[0], d[0], abs_tol=1e-6)
+            if first_vertical and second_vertical:
+                return math.isclose(a[0], c[0], abs_tol=1e-6) and spans_overlap(a[1], b[1], c[1], d[1])
+            if not first_vertical and not second_vertical:
+                return math.isclose(a[1], c[1], abs_tol=1e-6) and spans_overlap(a[0], b[0], c[0], d[0])
+            vertical, horizontal = (first, second) if first_vertical else (second, first)
+            (v1, v2), (h1, h2) = vertical, horizontal
+            intersects = (
+                min(h1[0], h2[0]) - 1e-6 <= v1[0] <= max(h1[0], h2[0]) + 1e-6
+                and min(v1[1], v2[1]) - 1e-6 <= h1[1] <= max(v1[1], v2[1]) + 1e-6
+            )
+            if not intersects:
+                return False
+            # A clean X crossing is sometimes unavoidable in a dense AON
+            # graph and does not imply a dependency.  A T/corner contact,
+            # however, looks like one relationship joins another, so it is
+            # prohibited whenever the intersection is an endpoint of
+            # either segment.
+            at_vertical_end = math.isclose(h1[1], v1[1], abs_tol=1e-6) or math.isclose(
+                h1[1], v2[1], abs_tol=1e-6
+            )
+            at_horizontal_end = math.isclose(v1[0], h1[0], abs_tol=1e-6) or math.isclose(
+                v1[0], h2[0], abs_tol=1e-6
+            )
+            return at_vertical_end or at_horizontal_end
+
+        def touches_accepted(points: list[tuple[float, float]]) -> bool:
+            segments = orthogonal_segments(points)
+            return any(
+                physically_touches(segment, accepted)
+                for segment in segments
+                for accepted in accepted_all_segments
+            )
+
         def overlaps_accepted(points: list[tuple[float, float]]) -> bool:
             segments = orthogonal_segments(points)
             # The first/last segment is the short fan-out between a fixed node
             # port and its channel.  High-degree nodes cannot physically keep
             # full channel clearance inside a 64-unit edge; enforce clearance
             # after those short endpoint stubs.
-            channel_segments = segments[1:-1] if len(segments) > 2 else []
-            return any(
+            channel_segments = segments[1:-1] if len(segments) > 2 else segments
+            too_close = any(
                 segments_too_close(segment, accepted)
                 for segment in channel_segments
                 for accepted in accepted_segments
             )
+            if too_close:
+                return True
 
-        for link_index in sorted(geometry_by_link):
+            # Endpoint fan-out stubs may use reduced spacing at a high-degree
+            # node, but two different relationships must still never share,
+            # touch, or cross the same geometric segment.
+
+            return touches_accepted(points)
+
+        final_order = sorted(
+            geometry_by_link,
+            key=lambda index: (
+                0
+                if path_hits_node(link_by_index[index], list(geometry_by_link[index]["points"]))
+                else 1,
+                -abs(
+                    float(geometry_by_link[index]["start"][1])
+                    - float(geometry_by_link[index]["base"][1])
+                ),
+                index,
+            ),
+        )
+        for link_index in final_order:
             geometry = geometry_by_link[link_index]
             points = list(geometry["points"])
-            if overlaps_accepted(points):
-                link = link_by_index[link_index]
+            link = link_by_index[link_index]
+            hits_node = path_hits_node(link, points)
+            if hits_node or overlaps_accepted(points):
                 start = (float(geometry["start"][0]), float(geometry["start"][1]))
                 arrow_base = (float(geometry["base"][0]), float(geometry["base"][1]))
                 source_shift = 1 if geometry.get("source_side", "R") == "R" else -1
                 target_shift = -int(geometry["arrow_direction"])
                 chosen = None
-                for attempt in range(1, 401):
+
+                # First retry the shortest dogleg with a wider trunk search.
+                # This is the preferred shape for vertically separated nodes:
+                # leave the source horizontally, turn directly toward the
+                # target, then enter the arrow horizontally.
+                for attempt in range(1, 121):
+                    trunk_x = start[0] + source_shift * (
+                        10.0 + attempt * MIN_VERTICAL_CHANNEL_SPACING
+                    )
+                    candidate = simplify_points(
+                        [start, (trunk_x, start[1]), (trunk_x, arrow_base[1]), arrow_base]
+                    )
+                    if not path_hits_node(link, candidate) and not overlaps_accepted(candidate):
+                        chosen = candidate
+                        break
+
+                # A compact four-turn corridor stays on the target side and
+                # expands around nearby node rectangles.  This is preferred
+                # to a drawing-wide U-shaped emergency route.
+                for attempt in range(1, 401) if chosen is None else ():
+                    side = -1 if arrow_base[1] <= start[1] else 1
+                    local_edge = (
+                        min(start[1], arrow_base[1]) - NODE_HEIGHT
+                        if side < 0
+                        else max(start[1], arrow_base[1])
+                    )
+                    outside_y = local_edge + side * (
+                        14.0 + attempt * MIN_HORIZONTAL_CHANNEL_SPACING
+                    )
+                    source_x = start[0] + source_shift * (
+                        10.0 + attempt * MIN_VERTICAL_CHANNEL_SPACING
+                    )
+                    target_x = arrow_base[0] + target_shift * (
+                        10.0 + attempt * MIN_VERTICAL_CHANNEL_SPACING
+                    )
+                    candidate = simplify_points(
+                        [
+                            start,
+                            (source_x, start[1]),
+                            (source_x, outside_y),
+                            (target_x, outside_y),
+                            (target_x, arrow_base[1]),
+                            arrow_base,
+                        ]
+                    )
+                    if not path_hits_node(link, candidate) and not overlaps_accepted(candidate):
+                        chosen = candidate
+                        break
+
+                # If a node blocks every single-trunk option, use a local
+                # detour on the target side (down for a lower successor, up
+                # for an upper successor).  Never send a downward dependency
+                # to the top outer frame merely to alternate lane usage.
+                for attempt in range(1, 161) if chosen is None else ():
                     slot = deoverlap_links + attempt
-                    side = 1 if slot % 2 else -1
-                    outside_y = node_top + (4 + slot) * 11.0 if side > 0 else node_bottom - (4 + slot) * 11.0
+                    side = -1 if arrow_base[1] <= start[1] else 1
+                    local_edge = min(start[1], arrow_base[1]) - NODE_HEIGHT if side < 0 else max(start[1], arrow_base[1])
+                    outside_y = local_edge + side * (14.0 + slot * MIN_HORIZONTAL_CHANNEL_SPACING)
                     source_exit_x = start[0] + source_shift * (3.0 + attempt * 15.0)
                     target_exit_x = arrow_base[0] + target_shift * (3.0 + attempt * 15.0)
                     source_lane_y = start[1] + side * (5.0 + slot * 11.0)
@@ -1188,17 +1334,105 @@ class EzdxfAonWriter:
                             arrow_base,
                         ]
                     )
-                    if not overlaps_accepted(candidate):
+                    if not path_hits_node(link, candidate) and not overlaps_accepted(candidate):
                         chosen = candidate
                         break
+                if chosen is None:
+                    # Dense long links may not have the preferred full channel
+                    # spacing.  Relax spacing only, never node clearance or
+                    # physical line separation, and keep the route on the
+                    # natural target side.
+                    for attempt in range(1, 1001):
+                        side = -1 if arrow_base[1] <= start[1] else 1
+                        local_edge = (
+                            min(start[1], arrow_base[1]) - NODE_HEIGHT
+                            if side < 0
+                            else max(start[1], arrow_base[1])
+                        )
+                        outside_y = local_edge + side * (18.0 + attempt * 4.37)
+                        source_x = start[0] + source_shift * (12.0 + attempt * 5.13)
+                        target_x = arrow_base[0] + target_shift * (12.0 + attempt * 5.13)
+                        candidate = simplify_points(
+                            [
+                                start,
+                                (source_x, start[1]),
+                                (source_x, outside_y),
+                                (target_x, outside_y),
+                                (target_x, arrow_base[1]),
+                                arrow_base,
+                            ]
+                        )
+                        if not path_hits_node(link, candidate) and not touches_accepted(candidate):
+                            chosen = candidate
+                            break
+                if chosen is None:
+                    # Source and target corridors can require different x
+                    # offsets.  Search them independently as the final
+                    # node-clear fallback instead of sending the line to the
+                    # opposite side of the drawing.
+                    side = -1 if arrow_base[1] <= start[1] else 1
+                    local_edge = (
+                        min(start[1], arrow_base[1]) - NODE_HEIGHT
+                        if side < 0
+                        else max(start[1], arrow_base[1])
+                    )
+                    for y_step in range(1, 301):
+                        outside_y = local_edge + side * (
+                            18.0 + y_step * MIN_HORIZONTAL_CHANNEL_SPACING
+                        )
+                        source_candidates: list[float] = []
+                        target_candidates: list[float] = []
+                        for x_step in range(1, 161):
+                            source_x = start[0] + source_shift * (
+                                10.0 + x_step * MIN_VERTICAL_CHANNEL_SPACING
+                            )
+                            source_partial = simplify_points(
+                                [start, (source_x, start[1]), (source_x, outside_y)]
+                            )
+                            if not path_hits_node(link, source_partial):
+                                source_candidates.append(source_x)
+                            target_x = arrow_base[0] + target_shift * (
+                                10.0 + x_step * MIN_VERTICAL_CHANNEL_SPACING
+                            )
+                            target_partial = simplify_points(
+                                [(target_x, outside_y), (target_x, arrow_base[1]), arrow_base]
+                            )
+                            if not path_hits_node(link, target_partial):
+                                target_candidates.append(target_x)
+                            if len(source_candidates) >= 5 and len(target_candidates) >= 5:
+                                break
+                        for source_x in source_candidates[:5]:
+                            for target_x in target_candidates[:5]:
+                                candidate = simplify_points(
+                                    [
+                                        start,
+                                        (source_x, start[1]),
+                                        (source_x, outside_y),
+                                        (target_x, outside_y),
+                                        (target_x, arrow_base[1]),
+                                        arrow_base,
+                                    ]
+                                )
+                                if not path_hits_node(link, candidate) and not touches_accepted(candidate):
+                                    chosen = candidate
+                                    break
+                            if chosen is not None:
+                                break
+                        if chosen is not None:
+                            break
                 if chosen is not None:
                     points = chosen
                     geometry["points"] = points
                     geometry["label_position"] = label_position(points)
                     geometry["route_mode"] = "deoverlap_outer"
                     deoverlap_links += 1
+                    if hits_node:
+                        node_avoidance_links += 1
+                else:
+                    raise RuntimeError(f"No clear final route for link {link.index}")
             segments = orthogonal_segments(points)
-            accepted_segments.extend(segments[1:-1] if len(segments) > 2 else [])
+            accepted_segments.extend(segments[1:-1] if len(segments) > 2 else segments)
+            accepted_all_segments.extend(segments)
 
         return geometry_by_link, {
             "direct_links": len(direct_geometry),
@@ -1211,6 +1445,7 @@ class EzdxfAonWriter:
             "emergency_detour_links": emergency_detour_links,
             "forced_detour_links": forced_detour_links,
             "deoverlap_links": deoverlap_links,
+            "node_avoidance_links": node_avoidance_links,
             "upper_channel_links": sum(
                 int(base[link.index].get("channel_direction", 0)) > 0
                 and geometry_by_link[link.index].get("route_mode") == "detour"
