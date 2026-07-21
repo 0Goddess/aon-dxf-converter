@@ -323,8 +323,7 @@ def enlarge_layout(layout: DrawingLayout, time_scale: str = "month") -> DrawingL
         rows = sorted({row_assignment[uid] for uid, node in layout.nodes.items() if uid not in critical_uids and node.task.zone == zone})
         noncritical_rows_by_zone[zone] = rows
 
-    # Barycentric row sweeps reduce crossings without changing the requested
-    # zone order (zones with fewer activities remain above larger zones).
+    # Build relationship information used by the side and row ordering passes.
     row_members: dict[int, list[int]] = collections.defaultdict(list)
     for uid, old_row in row_assignment.items():
         if uid not in critical_uids:
@@ -338,22 +337,6 @@ def enlarge_layout(layout: DrawingLayout, time_scale: str = "month") -> DrawingL
         if succ_row is not None:
             linked_rows[succ_row].append(pred_row)
 
-    for _ in range(6):
-        flat_rows = [row for zone in zone_order for row in noncritical_rows_by_zone[zone]]
-        split_hint = (len(flat_rows) + 1) // 2
-        provisional = {
-            row: (split_hint - index if index < split_hint else -(index - split_hint + 1))
-            for index, row in enumerate(flat_rows)
-        }
-        for zone in zone_order:
-            def barycenter(row: int) -> float:
-                neighbors = linked_rows.get(row, [])
-                if not neighbors:
-                    return float(provisional.get(row, 0))
-                return sum(0.0 if neighbor is None else provisional.get(neighbor, 0) for neighbor in neighbors) / len(neighbors)
-            noncritical_rows_by_zone[zone].sort(
-                key=lambda row: (-barycenter(row), len(row_members[row]), min(layout.nodes[uid].task.task_id for uid in row_members[row]))
-            )
     ordered_noncritical_rows = sorted(
         [
             (zone, row)
@@ -423,6 +406,53 @@ def enlarge_layout(layout: DrawingLayout, time_scale: str = "month") -> DrawingL
         [(row_zone[row], row) for row, value in side.items() if value < 0],
         key=lambda item: order_index[item[1]],
     )
+
+    # With the upper/lower membership fixed, reorder rows on each side by the
+    # average position of their related rows.  Keeping membership fixed avoids
+    # destabilising the reserved routing corridors, while the barycentric
+    # sweep removes many avoidable X crossings.  Activity count remains only a
+    # tie-breaker, as crossing reduction is the primary layout objective.
+    for _ in range(8):
+        provisional = {
+            row: len(upper_rows) - index
+            for index, (_, row) in enumerate(upper_rows)
+        }
+        provisional.update(
+            {
+                row: -(index + 1)
+                for index, (_, row) in enumerate(lower_rows)
+            }
+        )
+
+        def fixed_side_barycenter(row: int) -> float:
+            neighbors = linked_rows.get(row, [])
+            if not neighbors:
+                return float(provisional[row])
+            return sum(
+                0.0 if neighbor is None else provisional.get(neighbor, 0)
+                for neighbor in neighbors
+            ) / len(neighbors)
+
+        next_upper = sorted(
+            upper_rows,
+            key=lambda item: (
+                -fixed_side_barycenter(item[1]),
+                len(row_members[item[1]]),
+                order_index[item[1]],
+            ),
+        )
+        next_lower = sorted(
+            lower_rows,
+            key=lambda item: (
+                -fixed_side_barycenter(item[1]),
+                len(row_members[item[1]]),
+                order_index[item[1]],
+            ),
+        )
+        if next_upper == upper_rows and next_lower == lower_rows:
+            break
+        upper_rows, lower_rows = next_upper, next_lower
+
     vertical_row: dict[int, int] = {}
     for index, (_, old_row) in enumerate(upper_rows):
         vertical_row[old_row] = len(upper_rows) - index
