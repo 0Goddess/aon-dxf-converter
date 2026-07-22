@@ -50,20 +50,11 @@ NODE_HEIGHT = 64.0
 # Compact month grid: enough room for a 150-unit node and routing channels,
 # without allowing a multi-year schedule to expand excessively.
 X_SPACING = 250.0
-# Extra vertical room is reserved for visibly separated horizontal channels.
-# The endpoint-group cleanup below then spreads any remaining near-coincident
-# horizontal stubs without adding corners or changing relationship objects.
-Y_SPACING = 175.0
+Y_SPACING = 145.0
 ARROW_LENGTH = 4.8
 ARROW_HALF_HEIGHT = 3.1
 MIN_VERTICAL_CHANNEL_SPACING = 14.0
 MIN_HORIZONTAL_CHANNEL_SPACING = 9.0
-PREFERRED_HORIZONTAL_CHANNEL_SPACING = 13.0
-# Every routed relationship must visibly leave and enter a work node through a
-# horizontal stub.  Measure the target stub from the arrow base (not its tip),
-# otherwise the arrow length consumes almost the entire apparent clearance.
-MIN_ENDPOINT_STUB_LENGTH = 28.0
-ENDPOINT_CHANNEL_STEP = 14.0
 
 
 TIME_SCALE_TITLES = {"week": "週", "month": "月", "quarter": "季", "year": "年"}
@@ -332,7 +323,8 @@ def enlarge_layout(layout: DrawingLayout, time_scale: str = "month") -> DrawingL
         rows = sorted({row_assignment[uid] for uid, node in layout.nodes.items() if uid not in critical_uids and node.task.zone == zone})
         noncritical_rows_by_zone[zone] = rows
 
-    # Build relationship information used by the side and row ordering passes.
+    # Barycentric row sweeps reduce crossings without changing the requested
+    # zone order (zones with fewer activities remain above larger zones).
     row_members: dict[int, list[int]] = collections.defaultdict(list)
     for uid, old_row in row_assignment.items():
         if uid not in critical_uids:
@@ -346,6 +338,22 @@ def enlarge_layout(layout: DrawingLayout, time_scale: str = "month") -> DrawingL
         if succ_row is not None:
             linked_rows[succ_row].append(pred_row)
 
+    for _ in range(6):
+        flat_rows = [row for zone in zone_order for row in noncritical_rows_by_zone[zone]]
+        split_hint = (len(flat_rows) + 1) // 2
+        provisional = {
+            row: (split_hint - index if index < split_hint else -(index - split_hint + 1))
+            for index, row in enumerate(flat_rows)
+        }
+        for zone in zone_order:
+            def barycenter(row: int) -> float:
+                neighbors = linked_rows.get(row, [])
+                if not neighbors:
+                    return float(provisional.get(row, 0))
+                return sum(0.0 if neighbor is None else provisional.get(neighbor, 0) for neighbor in neighbors) / len(neighbors)
+            noncritical_rows_by_zone[zone].sort(
+                key=lambda row: (-barycenter(row), len(row_members[row]), min(layout.nodes[uid].task.task_id for uid in row_members[row]))
+            )
     ordered_noncritical_rows = sorted(
         [
             (zone, row)
@@ -415,53 +423,6 @@ def enlarge_layout(layout: DrawingLayout, time_scale: str = "month") -> DrawingL
         [(row_zone[row], row) for row, value in side.items() if value < 0],
         key=lambda item: order_index[item[1]],
     )
-
-    # With the upper/lower membership fixed, reorder rows on each side by the
-    # average position of their related rows.  Keeping membership fixed avoids
-    # destabilising the reserved routing corridors, while the barycentric
-    # sweep removes many avoidable X crossings.  Activity count remains only a
-    # tie-breaker, as crossing reduction is the primary layout objective.
-    for _ in range(8):
-        provisional = {
-            row: len(upper_rows) - index
-            for index, (_, row) in enumerate(upper_rows)
-        }
-        provisional.update(
-            {
-                row: -(index + 1)
-                for index, (_, row) in enumerate(lower_rows)
-            }
-        )
-
-        def fixed_side_barycenter(row: int) -> float:
-            neighbors = linked_rows.get(row, [])
-            if not neighbors:
-                return float(provisional[row])
-            return sum(
-                0.0 if neighbor is None else provisional.get(neighbor, 0)
-                for neighbor in neighbors
-            ) / len(neighbors)
-
-        next_upper = sorted(
-            upper_rows,
-            key=lambda item: (
-                -fixed_side_barycenter(item[1]),
-                len(row_members[item[1]]),
-                order_index[item[1]],
-            ),
-        )
-        next_lower = sorted(
-            lower_rows,
-            key=lambda item: (
-                -fixed_side_barycenter(item[1]),
-                len(row_members[item[1]]),
-                order_index[item[1]],
-            ),
-        )
-        if next_upper == upper_rows and next_lower == lower_rows:
-            break
-        upper_rows, lower_rows = next_upper, next_lower
-
     vertical_row: dict[int, int] = {}
     for index, (_, old_row) in enumerate(upper_rows):
         vertical_row[old_row] = len(upper_rows) - index
@@ -474,212 +435,6 @@ def enlarge_layout(layout: DrawingLayout, time_scale: str = "month") -> DrawingL
         node.x = period_centers[task_period[uid]] - NODE_WIDTH / 2
         node.task.row = vertical_row[row_assignment[uid]]
         node.y = node.task.row * Y_SPACING
-
-    # Activities that fall in the same displayed period cannot be placed on
-    # one horizontal row.  Keep every same-period dependency component in a
-    # monotone vertical order instead.  Without this pass a sequence such as
-    # 79 -> 80 -> 81 -> 82 could be placed down/up/down in one month column,
-    # forcing the arrows to double back and producing several nearly joined
-    # horizontal segments.
-    same_period_neighbors: dict[int, set[int]] = collections.defaultdict(set)
-    same_period_links: list[Link] = []
-    for link in layout.links:
-        if link.pred_uid in critical_uids or link.succ_uid in critical_uids:
-            continue
-        pred = layout.nodes[link.pred_uid]
-        succ = layout.nodes[link.succ_uid]
-        if task_period[link.pred_uid] != task_period[link.succ_uid]:
-            continue
-        if (pred.task.row > 0) != (succ.task.row > 0):
-            continue
-        same_period_neighbors[link.pred_uid].add(link.succ_uid)
-        same_period_neighbors[link.succ_uid].add(link.pred_uid)
-        same_period_links.append(link)
-
-    ordering_predecessors: dict[int, list[int]] = collections.defaultdict(list)
-    ordering_successors: dict[int, list[int]] = collections.defaultdict(list)
-    for link in layout.links:
-        ordering_predecessors[link.succ_uid].append(link.pred_uid)
-        ordering_successors[link.pred_uid].append(link.succ_uid)
-
-    ordered_same_period_uids: set[int] = set()
-    preferred_between_link_indices: set[int] = set()
-    reordered_same_period_components = 0
-    seen_same_period: set[int] = set()
-    for seed_uid in sorted(same_period_neighbors):
-        if seed_uid in seen_same_period:
-            continue
-        component: set[int] = set()
-        queue = collections.deque([seed_uid])
-        while queue:
-            uid = queue.popleft()
-            if uid in component:
-                continue
-            component.add(uid)
-            queue.extend(same_period_neighbors[uid] - component)
-        seen_same_period.update(component)
-        if len(component) < 2:
-            continue
-
-        # Kahn ordering keeps explicit dependency direction authoritative;
-        # Project rank/start/ID provide a stable order for parallel branches.
-        component_successors: dict[int, list[int]] = collections.defaultdict(list)
-        indegree = {uid: 0 for uid in component}
-        for link in same_period_links:
-            if link.pred_uid in component and link.succ_uid in component:
-                component_successors[link.pred_uid].append(link.succ_uid)
-                indegree[link.succ_uid] += 1
-        # Branching components need a full layered-graph optimization; moving
-        # them as one sorted chain can improve one branch but badly congest
-        # another.  Restrict this local pass to true one-in/one-out sequences.
-        if any(
-            indegree[uid] > 1 or len(component_successors.get(uid, [])) > 1
-            for uid in component
-        ):
-            continue
-        ready = sorted(
-            (uid for uid, degree in indegree.items() if degree == 0),
-            key=lambda uid: (
-                layout.nodes[uid].task.rank,
-                task_dates(layout.nodes[uid].task)[0],
-                layout.nodes[uid].task.task_id,
-            ),
-        )
-        dependency_order: list[int] = []
-        while ready:
-            uid = ready.pop(0)
-            dependency_order.append(uid)
-            for successor in sorted(
-                component_successors.get(uid, []),
-                key=lambda other: (
-                    layout.nodes[other].task.rank,
-                    task_dates(layout.nodes[other].task)[0],
-                    layout.nodes[other].task.task_id,
-                ),
-            ):
-                indegree[successor] -= 1
-                if indegree[successor] == 0:
-                    ready.append(successor)
-                    ready.sort(
-                        key=lambda other: (
-                            layout.nodes[other].task.rank,
-                            task_dates(layout.nodes[other].task)[0],
-                            layout.nodes[other].task.task_id,
-                        )
-                    )
-        if len(dependency_order) != len(component):
-            continue
-
-        original_rows = {uid: layout.nodes[uid].task.row for uid in component}
-
-        def sequence_reversal_count(candidate_rows: dict[int, int]) -> int:
-            rows = [
-                candidate_rows.get(uid, original_rows[uid])
-                for uid in dependency_order
-            ]
-            directions = [
-                (next_row > current_row) - (next_row < current_row)
-                for current_row, next_row in zip(rows, rows[1:])
-                if current_row != next_row
-            ]
-            return sum(
-                first != second
-                for first, second in zip(directions, directions[1:])
-            )
-
-        original_reversals = sequence_reversal_count({})
-        if original_reversals == 0:
-            continue
-
-        def component_order_cost(candidate_rows: dict[int, int]) -> float:
-            def row_of(uid: int) -> int:
-                return candidate_rows.get(uid, layout.nodes[uid].task.row)
-
-            incident_links = {
-                link.index: link
-                for uid in component
-                for link in layout.links
-                if link.pred_uid == uid or link.succ_uid == uid
-            }
-            length_cost = sum(
-                abs(row_of(link.pred_uid) - row_of(link.succ_uid))
-                for link in incident_links.values()
-            )
-            affected_centers = component | {
-                uid
-                for member in component
-                for uid in ordering_predecessors.get(member, []) + ordering_successors.get(member, [])
-            }
-            reversal_count = sum(
-                1
-                for center_uid in affected_centers
-                for pred_uid in ordering_predecessors.get(center_uid, [])
-                for succ_uid in ordering_successors.get(center_uid, [])
-                if (
-                    (row_of(center_uid) - row_of(pred_uid))
-                    * (row_of(succ_uid) - row_of(center_uid))
-                    < 0
-                )
-            )
-            movement_cost = sum(
-                abs(candidate_rows[uid] - original_rows[uid])
-                for uid in candidate_rows
-            )
-            return length_cost + reversal_count * 18.0 + movement_cost * 0.05
-
-        # Search short windows around the reversal instead of sorting the
-        # complete sequence.  A two-node exchange is enough for the common
-        # up/down/up case and leaves every unrelated row untouched.
-        candidates: list[
-            tuple[int, int, int, float, int, int, dict[int, int]]
-        ] = []
-        for start_index in range(len(dependency_order) - 2):
-            maximum_end = min(len(dependency_order), start_index + 8)
-            for end_index in range(start_index + 3, maximum_end + 1):
-                window = dependency_order[start_index:end_index]
-                window_rows = sorted(original_rows[uid] for uid in window)
-                for rows in (window_rows, list(reversed(window_rows))):
-                    assignment = dict(zip(window, rows))
-                    moved_nodes = sum(
-                        assignment[uid] != original_rows[uid] for uid in window
-                    )
-                    total_displacement = sum(
-                        abs(assignment[uid] - original_rows[uid]) for uid in window
-                    )
-                    if moved_nodes > 2 or total_displacement > 8:
-                        continue
-                    improvement = original_reversals - sequence_reversal_count(
-                        assignment
-                    )
-                    if improvement <= 0:
-                        continue
-                    candidates.append(
-                        (
-                            -improvement,
-                            moved_nodes,
-                            total_displacement,
-                            component_order_cost(assignment),
-                            start_index,
-                            end_index,
-                            assignment,
-                        )
-                    )
-        if not candidates:
-            continue
-        _, _, _, _, _, _, chosen_assignment = min(candidates)
-        reordered_same_period_components += 1
-        for uid, row in chosen_assignment.items():
-            layout.nodes[uid].task.row = row
-            layout.nodes[uid].y = row * Y_SPACING
-        ordered_same_period_uids.update(chosen_assignment)
-        preferred_between_link_indices.update(
-            link.index
-            for link in same_period_links
-            if (
-                link.pred_uid in chosen_assignment
-                and link.succ_uid in chosen_assignment
-            )
-        )
 
     # Individual branch nodes may still land on the opposite side from all of
     # their dependencies because row packing works on whole chains.  Allow a
@@ -697,6 +452,7 @@ def enlarge_layout(layout: DrawingLayout, time_scale: str = "month") -> DrawingL
         (round(node.x, 6), node.task.row): uid
         for uid, node in layout.nodes.items()
     }
+
     max_side_row = max(abs(node.task.row) for node in layout.nodes.values())
     for _ in range(3):
         moved = False
@@ -704,35 +460,16 @@ def enlarge_layout(layout: DrawingLayout, time_scale: str = "month") -> DrawingL
             layout.nodes.items(),
             key=lambda item: (-item[1].task.rank, -len(incident.get(item[0], [])), item[1].task.task_id),
         ):
-            if (
-                uid in critical_uids
-                or uid in ordered_same_period_uids
-                or not predecessors.get(uid)
-                or node.task.row == 0
-            ):
+            if uid in critical_uids or not predecessors.get(uid) or node.task.row == 0:
                 continue
             weighted_neighbors = [
                 (layout.nodes[other], 3.0) for other in predecessors[uid]
             ] + [
                 (layout.nodes[other], 1.0) for other in successors.get(uid, [])
             ]
-
-            def local_reversal_penalty(candidate_y: float) -> float:
-                reversals = sum(
-                    1
-                    for pred_uid in predecessors.get(uid, [])
-                    for succ_uid in successors.get(uid, [])
-                    if (
-                        (candidate_y - layout.nodes[pred_uid].y)
-                        * (layout.nodes[succ_uid].y - candidate_y)
-                        < 0
-                    )
-                )
-                return reversals * Y_SPACING * 12.0
-
             current_cost = sum(
                 weight * abs(node.y - other.y) for other, weight in weighted_neighbors
-            ) + abs(node.y) * 0.08 + local_reversal_penalty(node.y)
+            ) + abs(node.y) * 0.08
             opposite_sign = -1 if node.task.row > 0 else 1
             candidates: list[tuple[float, int]] = []
             for magnitude in range(1, max_side_row + 1):
@@ -744,7 +481,7 @@ def enlarge_layout(layout: DrawingLayout, time_scale: str = "month") -> DrawingL
                 cost = sum(
                     weight * abs(candidate_y - other.y)
                     for other, weight in weighted_neighbors
-                ) + abs(candidate_y) * 0.08 + local_reversal_penalty(candidate_y)
+                ) + abs(candidate_y) * 0.08
                 candidates.append((cost, candidate_row))
             if not candidates:
                 continue
@@ -758,6 +495,165 @@ def enlarge_layout(layout: DrawingLayout, time_scale: str = "month") -> DrawingL
             moved = True
         if not moved:
             break
+
+    # Final drawing-wide row review.  Packing and zone balancing above are
+    # intentionally coarse; they can still leave a short FS chain alternating
+    # up/down between rows even though its time slots do not overlap.  Make
+    # small, collision-free row moves now, before routing, and score them by
+    # the relationships they straighten and the crossings they remove.
+    # Critical activities stay on row zero and no activity changes its X/time
+    # position.
+    layout_review_moves = 0
+    review_links = [
+        link
+        for link in layout.links
+        if link.relation == "FS" and link.pred_uid in layout.nodes and link.succ_uid in layout.nodes
+    ]
+    incident_links: dict[int, list[Link]] = collections.defaultdict(list)
+    for link in review_links:
+        incident_links[link.pred_uid].append(link)
+        incident_links[link.succ_uid].append(link)
+
+    def review_point(uid: int, override_uid: int | None = None, override_row: int | None = None) -> tuple[float, float]:
+        node = layout.nodes[uid]
+        row = override_row if uid == override_uid and override_row is not None else node.task.row
+        return (node.x + NODE_WIDTH / 2.0, row * Y_SPACING - NODE_HEIGHT / 2.0)
+
+    def proper_review_crossing(
+        first: Link,
+        second: Link,
+        override_uid: int | None = None,
+        override_row: int | None = None,
+    ) -> bool:
+        if {first.pred_uid, first.succ_uid} & {second.pred_uid, second.succ_uid}:
+            return False
+        a = review_point(first.pred_uid, override_uid, override_row)
+        b = review_point(first.succ_uid, override_uid, override_row)
+        c = review_point(second.pred_uid, override_uid, override_row)
+        d = review_point(second.succ_uid, override_uid, override_row)
+
+        def orient(p, q, r) -> float:
+            return (q[0] - p[0]) * (r[1] - p[1]) - (q[1] - p[1]) * (r[0] - p[0])
+
+        return orient(a, b, c) * orient(a, b, d) < -1e-6 and orient(c, d, a) * orient(c, d, b) < -1e-6
+
+    occupied = {
+        (round(node.x, 6), node.task.row): uid
+        for uid, node in layout.nodes.items()
+    }
+
+    def review_metrics() -> tuple[int, int, int]:
+        horizontal = sum(
+            layout.nodes[link.pred_uid].task.row == layout.nodes[link.succ_uid].task.row
+            for link in review_links
+        )
+        crossings = 0
+        for first_index, first in enumerate(review_links):
+            for second in review_links[first_index + 1 :]:
+                crossings += proper_review_crossing(first, second)
+        reversals = 0
+        for middle_uid in layout.nodes:
+            incoming_rows = [
+                layout.nodes[link.pred_uid].task.row
+                for link in incident_links.get(middle_uid, [])
+                if link.succ_uid == middle_uid
+            ]
+            outgoing_rows = [
+                layout.nodes[link.succ_uid].task.row
+                for link in incident_links.get(middle_uid, [])
+                if link.pred_uid == middle_uid
+            ]
+            middle_row = layout.nodes[middle_uid].task.row
+            reversals += sum(
+                (pred_row - middle_row) * (succ_row - middle_row) > 0
+                for pred_row in incoming_rows
+                for succ_row in outgoing_rows
+            )
+        return horizontal, crossings, reversals
+
+    review_before = review_metrics()
+
+    def review_local_cost(uid: int, candidate_row: int) -> float:
+        affected = incident_links.get(uid, [])
+        cost = abs(candidate_row) * 0.35
+        for link in affected:
+            other_uid = link.succ_uid if link.pred_uid == uid else link.pred_uid
+            other_row = layout.nodes[other_uid].task.row
+            row_gap = abs(candidate_row - other_row)
+            # A horizontal dependency removes a vertical trunk and two bends,
+            # so it is considerably more valuable than merely shortening one.
+            cost += 0.0 if row_gap == 0 else 72.0 + row_gap * 5.0
+            for other in review_links:
+                if other is link or uid in (other.pred_uid, other.succ_uid):
+                    continue
+                if proper_review_crossing(link, other, uid, candidate_row):
+                    cost += 240.0
+
+        # Penalize a peak/valley at this operation: arrows that arrive from
+        # one side and immediately return to it are the visual up/down/up case.
+        incoming_rows = [
+            layout.nodes[link.pred_uid].task.row
+            for link in affected
+            if link.succ_uid == uid
+        ]
+        outgoing_rows = [
+            layout.nodes[link.succ_uid].task.row
+            for link in affected
+            if link.pred_uid == uid
+        ]
+        for pred_row in incoming_rows:
+            for succ_row in outgoing_rows:
+                if (pred_row - candidate_row) * (succ_row - candidate_row) > 0:
+                    cost += 55.0
+        return cost
+
+    for _ in range(8):
+        changed = False
+        for uid, node in sorted(
+            layout.nodes.items(),
+            key=lambda item: (
+                -len(incident_links.get(item[0], [])),
+                item[1].task.rank,
+                item[1].task.task_id,
+            ),
+        ):
+            if uid in critical_uids or not incident_links.get(uid):
+                continue
+            neighbor_rows = {
+                layout.nodes[
+                    link.succ_uid if link.pred_uid == uid else link.pred_uid
+                ].task.row
+                for link in incident_links[uid]
+            }
+            candidates = {node.task.row, node.task.row - 1, node.task.row + 1}
+            candidates.update(row for row in neighbor_rows if row != 0)
+            if neighbor_rows:
+                ordered_neighbor_rows = sorted(neighbor_rows)
+                candidates.add(ordered_neighbor_rows[len(ordered_neighbor_rows) // 2])
+            candidates.discard(0)
+            feasible = []
+            for candidate_row in candidates:
+                owner = occupied.get((round(node.x, 6), candidate_row))
+                if owner is None or owner == uid:
+                    feasible.append(candidate_row)
+            if not feasible:
+                continue
+            current_cost = review_local_cost(uid, node.task.row)
+            best_row, best_cost = min(
+                ((row, review_local_cost(uid, row)) for row in feasible),
+                key=lambda item: (item[1], abs(item[0]), item[0]),
+            )
+            if best_row == node.task.row or best_cost >= current_cost - 8.0:
+                continue
+            occupied.pop((round(node.x, 6), node.task.row), None)
+            node.task.row = best_row
+            node.y = best_row * Y_SPACING
+            occupied[(round(node.x, 6), best_row)] = uid
+            layout_review_moves += 1
+            changed = True
+        if not changed:
+            break
+    review_after = review_metrics()
 
     layout.lane_ranges = {}
     for zone in zone_order:
@@ -775,10 +671,14 @@ def enlarge_layout(layout: DrawingLayout, time_scale: str = "month") -> DrawingL
         "group_rows": group_row_counts,
         "time_periods": len(periods),
         "time_scale": scale,
-        "same_period_components_reordered": reordered_same_period_components,
-        "preferred_between_links": len(preferred_between_link_indices),
+        "final_layout_review_moves": layout_review_moves,
+        "horizontal_fs_before_review": review_before[0],
+        "horizontal_fs_after_review": review_after[0],
+        "crossing_proxy_before_review": review_before[1],
+        "crossing_proxy_after_review": review_after[1],
+        "vertical_reversals_before_review": review_before[2],
+        "vertical_reversals_after_review": review_after[2],
     }
-    layout.preferred_between_links = preferred_between_link_indices
 
     layout.time_axis = [] if scale == "none" else [
         (period_label(period, scale), period_centers[period])
@@ -1003,9 +903,17 @@ class EzdxfAonWriter:
 
         direct_geometry: dict[int, dict[str, object]] = {}
         accepted_direct_segments: list[tuple[tuple[float, float], tuple[float, float]]] = []
-        for link in self.layout.links:
-            if link.index not in direct_level:
-                continue
+        # Short, consecutive same-row links get first choice of the direct
+        # corridor.  A long skip dependency must not force the visually
+        # obvious adjacent relationship into a U-shaped detour.
+        direct_candidates = sorted(
+            (link for link in self.layout.links if link.index in direct_level),
+            key=lambda link: (
+                abs(self.layout.nodes[link.succ_uid].x - self.layout.nodes[link.pred_uid].x),
+                link.index,
+            ),
+        )
+        for link in direct_candidates:
             pred = self.layout.nodes[link.pred_uid]
             succ = self.layout.nodes[link.succ_uid]
             y = direct_level[link.index]
@@ -1057,44 +965,15 @@ class EzdxfAonWriter:
                 for index in range(pool_count)
             ]
             if reserved:
-                # Direct relationships already occupy fixed elevations.  Take
-                # the closest pool slot out for each reserved level, then map
-                # the remaining slots top-to-bottom by the counterpart node's
-                # y-position.  This makes lower successors leave through lower
-                # ports instead of crossing an upper/direct relationship.
-                available = list(pool)
-                average_counterpart_y = sum(item[2] for item in endpoints) / max(1, len(endpoints))
-                prefer_upper_ports = average_counterpart_y > node_top + 1e-6
-                prefer_lower_ports = average_counterpart_y < node_top - NODE_HEIGHT - 1e-6
-                for value in sorted(reserved, reverse=True):
-                    if available:
-                        if prefer_upper_ports:
-                            # Reserve the lower equidistant slot so upper
-                            # successors retain the higher source port.
-                            tie_break = lambda level: level
-                        elif prefer_lower_ports:
-                            # Reserve the higher equidistant slot so lower
-                            # successors retain the lower source port.
-                            tie_break = lambda level: -level
-                        else:
-                            tie_break = lambda level: -level
-                        closest = min(
-                            available,
-                            key=lambda level: (abs(level - value), tie_break(level)),
-                        )
-                        available.remove(closest)
-                pool = sorted(available[:count], reverse=True)
+                pool.sort(key=lambda level: min(abs(level - value) for value in reserved), reverse=True)
+                pool = sorted(pool[:count], reverse=True)
             for slot, ((link_index, role, _), level) in enumerate(zip(ordered, pool)):
                 # Nearby nodes often generate identical port elevations.  A
-                # small deterministic offset prevents exact endpoint overlap
-                # while preserving the top-to-bottom fan-out order.
+                # small deterministic offset prevents unrelated endpoint
+                # stubs from appearing to join while remaining visually
+                # aligned inside the same node compartment.
                 jitter = ((((link_index + 1) * 613) % 997) / 996.0 - 0.5) * 1.8
-                node_top = self.layout.nodes[uid].y
-                adjusted_level = max(
-                    node_top - NODE_HEIGHT + 4.0,
-                    min(node_top - 4.0, level + jitter),
-                )
-                port_y[(link_index, role)] = adjusted_level
+                port_y[(link_index, role)] = level + jitter
                 port_slot[(link_index, role)] = slot
                 port_count[(link_index, role)] = count
 
@@ -1111,14 +990,8 @@ class EzdxfAonWriter:
             base_x = tx - arrow_direction * ARROW_LENGTH
 
             source_count = port_count[(link.index, "pred")]
-            source_spacing = min(
-                ENDPOINT_CHANNEL_STEP,
-                98.0 / max(1, source_count - 1),
-            )
-            source_offset = (
-                MIN_ENDPOINT_STUB_LENGTH
-                + port_slot[(link.index, "pred")] * source_spacing
-            )
+            source_spacing = min(12.0, 84.0 / max(1, source_count - 1))
+            source_offset = 10.0 + port_slot[(link.index, "pred")] * source_spacing
             source_bend_x = sx + source_offset * (1 if source_side == "R" else -1)
             channel_direction = -1 if succ.y <= pred.y else 1
             base[link.index] = {
@@ -1208,10 +1081,7 @@ class EzdxfAonWriter:
             count = horizontal_lane_count[link.index]
             half_gap = (Y_SPACING - NODE_HEIGHT) / 2.0
             available_height = max(12.0, half_gap - 16.0)
-            spacing = min(
-                PREFERRED_HORIZONTAL_CHANNEL_SPACING,
-                available_height / max(1, count - 1),
-            )
+            spacing = min(10.0, available_height / max(1, count - 1))
             direction = int(geometry["channel_direction"])
             pred_y = self.layout.nodes[link.pred_uid].y
             if direction > 0:
@@ -1239,15 +1109,12 @@ class EzdxfAonWriter:
         for link in routed_links:
             geometry = base[link.index]
             count = target_lane_count[link.index]
-            available_width = X_SPACING - NODE_WIDTH - 2.0 * MIN_ENDPOINT_STUB_LENGTH
-            spacing = min(
-                ENDPOINT_CHANNEL_STEP,
-                max(4.0, available_width / max(1, count - 1)),
-            )
-            offset = MIN_ENDPOINT_STUB_LENGTH + target_lane[link.index] * spacing
-            arrow_base_x = float(geometry["base"][0])
+            available_width = X_SPACING - NODE_WIDTH - 20.0
+            spacing = min(8.0, available_width / max(1, count - 1))
+            offset = 8.0 + target_lane[link.index] * spacing
+            target_x = float(geometry["tip"][0])
             direction = int(geometry["arrow_direction"])
-            geometry["target_bend_x"] = arrow_base_x - direction * offset
+            geometry["target_bend_x"] = target_x - direction * offset
 
         # Prefer the two-turn routing shown in the user's reference:
         # horizontal out of the source, one vertical trunk, then horizontal
@@ -1292,23 +1159,6 @@ class EzdxfAonWriter:
                     and math.isclose(first[1], second[1], abs_tol=1e-6)
                 )
             ]
-
-        def respects_endpoint_stubs(points: list[tuple[float, float]]) -> bool:
-            """Keep vertical channels visibly clear of both endpoint nodes."""
-            segments = orthogonal_segments(points)
-            if not segments:
-                return False
-            first, last = segments[0], segments[-1]
-            first_horizontal = math.isclose(first[0][1], first[1][1], abs_tol=1e-6)
-            last_horizontal = math.isclose(last[0][1], last[1][1], abs_tol=1e-6)
-            if not first_horizontal or not last_horizontal:
-                return False
-            first_length = abs(first[1][0] - first[0][0])
-            last_length = abs(last[1][0] - last[0][0])
-            return (
-                first_length >= MIN_ENDPOINT_STUB_LENGTH - 1e-6
-                and last_length >= MIN_ENDPOINT_STUB_LENGTH - 1e-6
-            )
 
         def enters_endpoint_node(
             segment: tuple[tuple[float, float], tuple[float, float]], node: DrawingNode
@@ -1377,11 +1227,7 @@ class EzdxfAonWriter:
                     allocated_horizontals.append((y1, low, high))
 
         def path_is_clear(link: Link, points: list[tuple[float, float]]) -> bool:
-            return (
-                respects_endpoint_stubs(points)
-                and not path_hits_node(link, points)
-                and path_has_channel_clearance(points)
-            )
+            return not path_hits_node(link, points) and path_has_channel_clearance(points)
 
         def label_position(points: list[tuple[float, float]]) -> tuple[float, float]:
             horizontal = [
@@ -1413,7 +1259,22 @@ class EzdxfAonWriter:
         relaxed_detour_links = 0
         emergency_detour_links = 0
         forced_detour_links = 0
-        for link in sorted(routed_links, key=lambda item: item.index):
+        # Route one source fan-out together, nearest target first.  This gives
+        # the short branch the inner trunk and moves progressively farther
+        # successors outward in a readable comb instead of interleaving them
+        # with unrelated channels.
+        routing_order = sorted(
+            routed_links,
+            key=lambda link: (
+                self.layout.nodes[link.pred_uid].x,
+                link.pred_uid,
+                abs(self.layout.nodes[link.succ_uid].y - self.layout.nodes[link.pred_uid].y),
+                abs(self.layout.nodes[link.succ_uid].x - self.layout.nodes[link.pred_uid].x),
+                -self.layout.nodes[link.succ_uid].y,
+                link.index,
+            ),
+        )
+        for link in routing_order:
             geometry = base[link.index]
             start = (float(geometry["start"][0]), float(geometry["start"][1]))
             arrow_base = (float(geometry["base"][0]), float(geometry["base"][1]))
@@ -1599,12 +1460,8 @@ class EzdxfAonWriter:
         # remaining collinear segment onto a unique outer lane.
         accepted_segments: list[tuple[tuple[float, float], tuple[float, float]]] = []
         accepted_all_segments: list[tuple[tuple[float, float], tuple[float, float]]] = []
-        accepted_link_segments: list[
-            tuple[int, tuple[tuple[float, float], tuple[float, float]]]
-        ] = []
         deoverlap_links = 0
         node_avoidance_links = 0
-        between_node_corridor_links = 0
         link_by_index = {link.index: link for link in self.layout.links}
         node_top = max(node.y for node in self.layout.nodes.values())
         node_bottom = min(node.y - NODE_HEIGHT for node in self.layout.nodes.values())
@@ -1655,39 +1512,6 @@ class EzdxfAonWriter:
                 v1[0], h2[0], abs_tol=1e-6
             )
             return at_vertical_end or at_horizontal_end
-
-        def proper_crossing_point(
-            first: tuple[tuple[float, float], tuple[float, float]],
-            second: tuple[tuple[float, float], tuple[float, float]],
-        ) -> tuple[float, float] | None:
-            """Return the point of an interior orthogonal X crossing."""
-            (a, b), (c, d) = first, second
-            first_vertical = math.isclose(a[0], b[0], abs_tol=1e-6)
-            second_vertical = math.isclose(c[0], d[0], abs_tol=1e-6)
-            if first_vertical == second_vertical:
-                return None
-            vertical, horizontal = (first, second) if first_vertical else (second, first)
-            (v1, v2), (h1, h2) = vertical, horizontal
-            if (
-                min(h1[0], h2[0]) + 1e-6 < v1[0] < max(h1[0], h2[0]) - 1e-6
-                and min(v1[1], v2[1]) + 1e-6 < h1[1] < max(v1[1], v2[1]) - 1e-6
-            ):
-                return (v1[0], h1[1])
-            return None
-
-        def properly_crosses(
-            first: tuple[tuple[float, float], tuple[float, float]],
-            second: tuple[tuple[float, float], tuple[float, float]],
-        ) -> bool:
-            return proper_crossing_point(first, second) is not None
-
-        def crosses_same_source(link: Link, points: list[tuple[float, float]]) -> bool:
-            # Port ordering already separates the source fan-out.  Do not turn
-            # a remaining clean X crossing into a hard routing failure: dense
-            # networks can have no alternative once node and no-touch rules
-            # are applied.  Crossings remain a route-order preference rather
-            # than an absolute feasibility condition.
-            return False
 
         def touches_accepted(points: list[tuple[float, float]]) -> bool:
             segments = orthogonal_segments(points)
@@ -1757,10 +1581,7 @@ class EzdxfAonWriter:
         # bends that do not avoid any work node.
         for link_index, geometry in geometry_by_link.items():
             link = link_by_index[link_index]
-            original = list(geometry["points"])
-            simplified = remove_unnecessary_detours(link, original)
-            if not bool(geometry.get("direct")) and not respects_endpoint_stubs(simplified):
-                simplified = original
+            simplified = remove_unnecessary_detours(link, list(geometry["points"]))
             geometry["points"] = simplified
             geometry["label_position"] = label_position(simplified)
 
@@ -1789,22 +1610,12 @@ class EzdxfAonWriter:
             points = list(geometry["points"])
             link = link_by_index[link_index]
             hits_node = path_hits_node(link, points)
-            bad_endpoint_stubs = (
-                not bool(geometry.get("direct"))
-                and not respects_endpoint_stubs(points)
-            )
-            if (
-                hits_node
-                or bad_endpoint_stubs
-                or overlaps_accepted(points)
-                or crosses_same_source(link, points)
-            ):
+            if hits_node or overlaps_accepted(points):
                 start = (float(geometry["start"][0]), float(geometry["start"][1]))
                 arrow_base = (float(geometry["base"][0]), float(geometry["base"][1]))
                 source_shift = 1 if geometry.get("source_side", "R") == "R" else -1
                 target_shift = -int(geometry["arrow_direction"])
                 chosen = None
-                chosen_mode = ""
 
                 # First retry the shortest dogleg with a wider trunk search.
                 # This is the preferred shape for vertically separated nodes:
@@ -1817,93 +1628,9 @@ class EzdxfAonWriter:
                     candidate = simplify_points(
                         [start, (trunk_x, start[1]), (trunk_x, arrow_base[1]), arrow_base]
                     )
-                    if respects_endpoint_stubs(candidate) and not path_hits_node(link, candidate) and not overlaps_accepted(candidate) and not crosses_same_source(link, candidate):
+                    if not path_hits_node(link, candidate) and not overlaps_accepted(candidate):
                         chosen = candidate
                         break
-
-                # For vertically separated work nodes, try the free band
-                # between their boxes before going around the far side of the
-                # target.  This yields H-V-H-V-H without the misleading
-                # overshoot/U-turn seen when a link went above an upper target
-                # (or below a lower target) and then came back.
-                if chosen is None:
-                    pred_node = self.layout.nodes[link.pred_uid]
-                    succ_node = self.layout.nodes[link.succ_uid]
-                    if succ_node.y > pred_node.y:
-                        corridor_low = pred_node.y + 12.0
-                        corridor_high = succ_node.y - NODE_HEIGHT - 12.0
-                    elif succ_node.y < pred_node.y:
-                        corridor_low = succ_node.y + 12.0
-                        corridor_high = pred_node.y - NODE_HEIGHT - 12.0
-                    else:
-                        corridor_low = 1.0
-                        corridor_high = 0.0
-                    if corridor_low <= corridor_high:
-                        midpoint = (corridor_low + corridor_high) / 2.0
-                        corridor_levels = {
-                            midpoint,
-                            corridor_low,
-                            corridor_high,
-                        }
-                        level_count = int(
-                            (corridor_high - corridor_low)
-                            // PREFERRED_HORIZONTAL_CHANNEL_SPACING
-                        )
-                        for level_index in range(1, min(8, level_count + 1)):
-                            corridor_levels.add(
-                                corridor_low
-                                + level_index * PREFERRED_HORIZONTAL_CHANNEL_SPACING
-                            )
-                        source_x0 = float(geometry["source_bend_x"])
-                        target_x0 = float(geometry["target_bend_x"])
-                        x_pairs = sorted(
-                            (
-                                (
-                                    source_step + target_step,
-                                    source_x0
-                                    + source_shift
-                                    * source_step
-                                    * MIN_VERTICAL_CHANNEL_SPACING,
-                                    target_x0
-                                    + target_shift
-                                    * target_step
-                                    * MIN_VERTICAL_CHANNEL_SPACING,
-                                )
-                                for source_step in range(8)
-                                for target_step in range(8)
-                            ),
-                            key=lambda item: (
-                                item[0],
-                                abs(item[1] - item[2]),
-                            ),
-                        )
-                        for corridor_y in sorted(
-                            corridor_levels,
-                            key=lambda level: abs(level - midpoint),
-                        ):
-                            for _, source_x, target_x in x_pairs:
-                                candidate = simplify_points(
-                                    [
-                                        start,
-                                        (source_x, start[1]),
-                                        (source_x, corridor_y),
-                                        (target_x, corridor_y),
-                                        (target_x, arrow_base[1]),
-                                        arrow_base,
-                                    ]
-                                )
-                                if (
-                                    respects_endpoint_stubs(candidate)
-                                    and not path_hits_node(link, candidate)
-                                    and not overlaps_accepted(candidate)
-                                    and not crosses_same_source(link, candidate)
-                                ):
-                                    chosen = candidate
-                                    chosen_mode = "between_nodes"
-                                    between_node_corridor_links += 1
-                                    break
-                            if chosen is not None:
-                                break
 
                 # A compact four-turn corridor stays on the target side and
                 # expands around nearby node rectangles.  This is preferred
@@ -1934,7 +1661,7 @@ class EzdxfAonWriter:
                             arrow_base,
                         ]
                     )
-                    if respects_endpoint_stubs(candidate) and not path_hits_node(link, candidate) and not overlaps_accepted(candidate) and not crosses_same_source(link, candidate):
+                    if not path_hits_node(link, candidate) and not overlaps_accepted(candidate):
                         chosen = candidate
                         break
 
@@ -1947,12 +1674,8 @@ class EzdxfAonWriter:
                     side = -1 if arrow_base[1] <= start[1] else 1
                     local_edge = min(start[1], arrow_base[1]) - NODE_HEIGHT if side < 0 else max(start[1], arrow_base[1])
                     outside_y = local_edge + side * (14.0 + slot * MIN_HORIZONTAL_CHANNEL_SPACING)
-                    source_exit_x = start[0] + source_shift * (
-                        MIN_ENDPOINT_STUB_LENGTH + (attempt - 1) * 15.0
-                    )
-                    target_exit_x = arrow_base[0] + target_shift * (
-                        MIN_ENDPOINT_STUB_LENGTH + (attempt - 1) * 15.0
-                    )
+                    source_exit_x = start[0] + source_shift * (3.0 + attempt * 15.0)
+                    target_exit_x = arrow_base[0] + target_shift * (3.0 + attempt * 15.0)
                     source_lane_y = start[1] + side * (5.0 + slot * 11.0)
                     target_lane_y = arrow_base[1] + side * (5.0 + slot * 11.0)
                     source_outer_x = source_exit_x + source_shift * (8.0 + slot * 16.0)
@@ -1971,7 +1694,7 @@ class EzdxfAonWriter:
                             arrow_base,
                         ]
                     )
-                    if respects_endpoint_stubs(candidate) and not path_hits_node(link, candidate) and not overlaps_accepted(candidate) and not crosses_same_source(link, candidate):
+                    if not path_hits_node(link, candidate) and not overlaps_accepted(candidate):
                         chosen = candidate
                         break
                 if chosen is None:
@@ -1999,7 +1722,7 @@ class EzdxfAonWriter:
                                 arrow_base,
                             ]
                         )
-                        if respects_endpoint_stubs(candidate) and not path_hits_node(link, candidate) and not touches_accepted(candidate) and not crosses_same_source(link, candidate):
+                        if not path_hits_node(link, candidate) and not touches_accepted(candidate):
                             chosen = candidate
                             break
                 if chosen is None:
@@ -2050,7 +1773,7 @@ class EzdxfAonWriter:
                                         arrow_base,
                                     ]
                                 )
-                                if respects_endpoint_stubs(candidate) and not path_hits_node(link, candidate) and not touches_accepted(candidate) and not crosses_same_source(link, candidate):
+                                if not path_hits_node(link, candidate) and not touches_accepted(candidate):
                                     chosen = candidate
                                     break
                             if chosen is not None:
@@ -2059,12 +1782,12 @@ class EzdxfAonWriter:
                             break
                 if chosen is not None:
                     shortened = remove_unnecessary_detours(link, chosen)
-                    if respects_endpoint_stubs(shortened) and not path_hits_node(link, shortened) and not overlaps_accepted(shortened):
+                    if not path_hits_node(link, shortened) and not overlaps_accepted(shortened):
                         chosen = shortened
                     points = chosen
                     geometry["points"] = points
                     geometry["label_position"] = label_position(points)
-                    geometry["route_mode"] = chosen_mode or "deoverlap_outer"
+                    geometry["route_mode"] = "deoverlap_outer"
                     deoverlap_links += 1
                     if hits_node:
                         node_avoidance_links += 1
@@ -2073,9 +1796,6 @@ class EzdxfAonWriter:
             segments = orthogonal_segments(points)
             accepted_segments.extend(segments[1:-1] if len(segments) > 2 else segments)
             accepted_all_segments.extend(segments)
-            accepted_link_segments.extend(
-                (link.pred_uid, segment) for segment in segments[:2]
-            )
 
         def path_self_intersects(points: list[tuple[float, float]]) -> bool:
             segments = orthogonal_segments(points)
@@ -2124,15 +1844,6 @@ class EzdxfAonWriter:
                 if other_index != link_index
                 for segment in orthogonal_segments(list(other_geometry["points"]))
             ]
-            same_source_other_segments = [
-                segment
-                for other_index, other_geometry in geometry_by_link.items()
-                if (
-                    other_index != link_index
-                    and link_by_index[other_index].pred_uid == link.pred_uid
-                )
-                for segment in orthogonal_segments(list(other_geometry["points"]))[:2]
-            ]
             raw_candidates: list[list[tuple[float, float]]] = []
             for start_index in range(len(current) - 2):
                 for end_index in range(start_index + 2, len(current)):
@@ -2161,11 +1872,7 @@ class EzdxfAonWriter:
                 )
             )
             for candidate in raw_candidates[:24]:
-                if (
-                    (not bool(geometry.get("direct")) and not respects_endpoint_stubs(candidate))
-                    or path_hits_node(link, candidate)
-                    or path_self_intersects(candidate)
-                ):
+                if path_hits_node(link, candidate) or path_self_intersects(candidate):
                     continue
                 candidate_segments = orthogonal_segments(candidate)
                 if any(
@@ -2180,375 +1887,6 @@ class EzdxfAonWriter:
                 post_simplified_links += 1
                 break
 
-        # Revisit only the small same-period chain windows that the layout
-        # pass reordered.  Once every other relationship is known, an
-        # overshooting outer route can often be moved into the free band
-        # between the two work boxes without disturbing the rest of the
-        # drawing.  This late pass is deliberately narrow so dense unrelated
-        # branches keep the proven global routing order.
-        preferred_between_cleanup_links = 0
-        preferred_link_indices = set(
-            getattr(self.layout, "preferred_between_links", set())
-        )
-        for link_index in sorted(preferred_link_indices):
-            geometry = geometry_by_link.get(link_index)
-            if geometry is None or bool(geometry.get("direct")):
-                continue
-            link = link_by_index[link_index]
-            current = list(geometry["points"])
-            start = (float(geometry["start"][0]), float(geometry["start"][1]))
-            arrow_base = (float(geometry["base"][0]), float(geometry["base"][1]))
-            endpoint_low, endpoint_high = sorted((start[1], arrow_base[1]))
-            current_horizontals = [
-                first[1]
-                for first, second in orthogonal_segments(current)[1:-1]
-                if math.isclose(first[1], second[1], abs_tol=1e-6)
-            ]
-            if not any(
-                level < endpoint_low - 1e-6 or level > endpoint_high + 1e-6
-                for level in current_horizontals
-            ):
-                continue
-
-            pred_node = self.layout.nodes[link.pred_uid]
-            succ_node = self.layout.nodes[link.succ_uid]
-            if succ_node.y > pred_node.y:
-                corridor_low = pred_node.y + 12.0
-                corridor_high = succ_node.y - NODE_HEIGHT - 12.0
-            elif succ_node.y < pred_node.y:
-                corridor_low = succ_node.y + 12.0
-                corridor_high = pred_node.y - NODE_HEIGHT - 12.0
-            else:
-                continue
-            if corridor_low > corridor_high:
-                continue
-
-            other_segments = [
-                segment
-                for other_index, other_geometry in geometry_by_link.items()
-                if other_index != link_index
-                for segment in orthogonal_segments(list(other_geometry["points"]))
-            ]
-            midpoint = (corridor_low + corridor_high) / 2.0
-            corridor_levels = {corridor_low, midpoint, corridor_high}
-            level = corridor_low
-            while level <= corridor_high + 1e-6:
-                corridor_levels.add(level)
-                level += PREFERRED_HORIZONTAL_CHANNEL_SPACING
-
-            source_shift = 1 if geometry.get("source_side", "R") == "R" else -1
-            target_shift = -int(geometry["arrow_direction"])
-            source_x0 = float(geometry["source_bend_x"])
-            target_x0 = float(geometry["target_bend_x"])
-            replacement = None
-            for corridor_y in sorted(
-                corridor_levels,
-                key=lambda candidate_y: abs(candidate_y - midpoint),
-            ):
-                source_candidates: list[float] = []
-                target_candidates: list[float] = []
-                for x_step in range(20):
-                    source_x = (
-                        source_x0
-                        + source_shift * x_step * 7.0
-                    )
-                    source_partial = simplify_points(
-                        [start, (source_x, start[1]), (source_x, corridor_y)]
-                    )
-                    if not path_hits_node(link, source_partial):
-                        source_candidates.append(source_x)
-                    target_x = (
-                        target_x0
-                        + target_shift * x_step * 7.0
-                    )
-                    target_partial = simplify_points(
-                        [
-                            (target_x, corridor_y),
-                            (target_x, arrow_base[1]),
-                            arrow_base,
-                        ]
-                    )
-                    if not path_hits_node(link, target_partial):
-                        target_candidates.append(target_x)
-                combinations = sorted(
-                    (
-                        (
-                            abs(source_x - source_x0)
-                            + abs(target_x - target_x0),
-                            abs(source_x - target_x),
-                            source_x,
-                            target_x,
-                        )
-                        for source_x in source_candidates[:16]
-                        for target_x in target_candidates[:16]
-                    ),
-                    key=lambda item: (item[0], item[1]),
-                )
-                for _, _, source_x, target_x in combinations:
-                    candidate = simplify_points(
-                        [
-                            start,
-                            (source_x, start[1]),
-                            (source_x, corridor_y),
-                            (target_x, corridor_y),
-                            (target_x, arrow_base[1]),
-                            arrow_base,
-                        ]
-                    )
-                    if (
-                        not respects_endpoint_stubs(candidate)
-                        or path_hits_node(link, candidate)
-                        or path_self_intersects(candidate)
-                    ):
-                        continue
-                    candidate_segments = orthogonal_segments(candidate)
-                    if any(
-                        physically_touches(segment, other)
-                        for segment in candidate_segments
-                        for other in other_segments
-                    ):
-                        continue
-                    replacement = candidate
-                    break
-                if replacement is not None:
-                    break
-            if replacement is not None:
-                geometry["points"] = replacement
-                geometry["label_position"] = label_position(replacement)
-                geometry["route_mode"] = "between_nodes_cleanup"
-                preferred_between_cleanup_links += 1
-
-        # Spread only endpoint groups whose horizontal stubs still appear
-        # glued to a neighboring endpoint stub.  This is a late visual pass:
-        # complete relationship paths already exist, so a candidate vertical
-        # shift is accepted only if the whole updated polyline remains clear.
-        # Moving the first/last two points keeps every relationship a single
-        # polyline and adds no extra corner.
-        endpoint_group_spread_adjustments = 0
-        endpoint_group_spread_links: set[int] = set()
-
-        def endpoint_stub_records() -> list[
-            tuple[int, str, tuple[tuple[float, float], tuple[float, float]]]
-        ]:
-            records = []
-            for other_index, other_geometry in geometry_by_link.items():
-                segments = orthogonal_segments(list(other_geometry["points"]))
-                if not segments:
-                    continue
-                records.append((other_index, "pred", segments[0]))
-                if len(segments) > 1:
-                    records.append((other_index, "succ", segments[-1]))
-            return records
-
-        def horizontal_stub_score(
-            candidate_records: list[
-                tuple[int, str, tuple[tuple[float, float], tuple[float, float]]]
-            ],
-            fixed_records: list[
-                tuple[int, str, tuple[tuple[float, float], tuple[float, float]]]
-            ],
-        ) -> tuple[int, float]:
-            conflicts = 0
-            deficit = 0.0
-            comparisons = [
-                (candidate, fixed)
-                for candidate in candidate_records
-                for fixed in fixed_records
-            ]
-            comparisons.extend(
-                (candidate_records[first], candidate_records[second])
-                for first in range(len(candidate_records))
-                for second in range(first + 1, len(candidate_records))
-            )
-            for (_, _, first), (_, _, second) in comparisons:
-                (a, b), (c, d) = first, second
-                if not (
-                    math.isclose(a[1], b[1], abs_tol=1e-6)
-                    and math.isclose(c[1], d[1], abs_tol=1e-6)
-                ):
-                    continue
-                overlap = min(max(a[0], b[0]), max(c[0], d[0])) - max(
-                    min(a[0], b[0]), min(c[0], d[0])
-                )
-                if overlap <= 0.01:
-                    continue
-                gap = abs(a[1] - c[1])
-                if gap >= PREFERRED_HORIZONTAL_CHANNEL_SPACING - 1e-6:
-                    continue
-                conflicts += 1
-                deficit += (
-                    PREFERRED_HORIZONTAL_CHANNEL_SPACING - gap
-                ) * min(overlap, 80.0)
-            return conflicts, deficit
-
-        for (uid, _), endpoints in sorted(
-            endpoint_groups.items(),
-            key=lambda item: (
-                self.layout.nodes[item[0][0]].y,
-                self.layout.nodes[item[0][0]].x,
-                item[0][1],
-            ),
-        ):
-            group_roles = [
-                (link_index, role)
-                for link_index, role, _ in endpoints
-                if link_index in geometry_by_link
-            ]
-            if not group_roles:
-                continue
-            group_indices = {link_index for link_index, _ in group_roles}
-            all_endpoint_records = endpoint_stub_records()
-            fixed_endpoint_records = [
-                record
-                for record in all_endpoint_records
-                if record[0] not in group_indices
-            ]
-            current_records = [
-                record
-                for record in all_endpoint_records
-                if (record[0], record[1]) in group_roles
-            ]
-            current_score = horizontal_stub_score(
-                current_records, fixed_endpoint_records
-            )
-            if current_score[0] == 0:
-                continue
-
-            node = self.layout.nodes[uid]
-            current_levels = []
-            for link_index, role in group_roles:
-                points = list(geometry_by_link[link_index]["points"])
-                current_levels.append(points[0][1] if role == "pred" else points[-1][1])
-            minimum_shift = max(
-                node.y - NODE_HEIGHT + 4.0 - level for level in current_levels
-            )
-            maximum_shift = min(node.y - 4.0 - level for level in current_levels)
-            candidate_shifts = {minimum_shift, maximum_shift}
-            for step in range(-4, 5):
-                candidate_shifts.add(step * PREFERRED_HORIZONTAL_CHANNEL_SPACING)
-            for _, _, segment in current_records:
-                level = segment[0][1]
-                low_x, high_x = sorted((segment[0][0], segment[1][0]))
-                for _, _, other_segment in fixed_endpoint_records:
-                    other_low, other_high = sorted(
-                        (other_segment[0][0], other_segment[1][0])
-                    )
-                    if min(high_x, other_high) - max(low_x, other_low) <= 0.01:
-                        continue
-                    other_level = other_segment[0][1]
-                    candidate_shifts.add(
-                        other_level + PREFERRED_HORIZONTAL_CHANNEL_SPACING - level
-                    )
-                    candidate_shifts.add(
-                        other_level - PREFERRED_HORIZONTAL_CHANNEL_SPACING - level
-                    )
-
-            feasible_shifts = sorted(
-                {
-                    max(minimum_shift, min(maximum_shift, float(shift)))
-                    for shift in candidate_shifts
-                    if abs(float(shift)) > 1e-6
-                },
-                key=abs,
-            )
-            fixed_all_segments = [
-                segment
-                for other_index, other_geometry in geometry_by_link.items()
-                if other_index not in group_indices
-                for segment in orthogonal_segments(list(other_geometry["points"]))
-            ]
-            best: tuple[
-                tuple[int, float, float],
-                float,
-                dict[int, list[tuple[float, float]]],
-            ] | None = None
-            for shift in feasible_shifts:
-                candidate_paths: dict[int, list[tuple[float, float]]] = {}
-                candidate_endpoint_records = []
-                valid = True
-                for link_index, role in group_roles:
-                    geometry = geometry_by_link[link_index]
-                    points = list(geometry["points"])
-                    if len(points) < 2:
-                        valid = False
-                        break
-                    if role == "pred":
-                        points[0] = (points[0][0], points[0][1] + shift)
-                        points[1] = (points[1][0], points[1][1] + shift)
-                    else:
-                        points[-2] = (points[-2][0], points[-2][1] + shift)
-                        points[-1] = (points[-1][0], points[-1][1] + shift)
-                    points = simplify_points(points)
-                    link = link_by_index[link_index]
-                    if (
-                        not respects_endpoint_stubs(points)
-                        or path_hits_node(link, points)
-                        or path_self_intersects(points)
-                    ):
-                        valid = False
-                        break
-                    candidate_paths[link_index] = points
-                    segments = orthogonal_segments(points)
-                    endpoint_segment = segments[0] if role == "pred" else segments[-1]
-                    candidate_endpoint_records.append(
-                        (link_index, role, endpoint_segment)
-                    )
-                if not valid:
-                    continue
-
-                candidate_all_segments = [
-                    (link_index, segment)
-                    for link_index, points in candidate_paths.items()
-                    for segment in orthogonal_segments(points)
-                ]
-                if any(
-                    physically_touches(segment, other)
-                    for _, segment in candidate_all_segments
-                    for other in fixed_all_segments
-                ):
-                    continue
-                if any(
-                    first_index != second_index
-                    and physically_touches(first, second)
-                    for first_index, first in candidate_all_segments
-                    for second_index, second in candidate_all_segments
-                ):
-                    continue
-
-                score = horizontal_stub_score(
-                    candidate_endpoint_records, fixed_endpoint_records
-                )
-                ranked_score = (score[0], score[1], abs(shift))
-                if (score[0], score[1]) >= current_score:
-                    continue
-                if best is None or ranked_score < best[0]:
-                    best = (ranked_score, shift, candidate_paths)
-            if best is None:
-                continue
-
-            _, shift, candidate_paths = best
-            for link_index, role in group_roles:
-                geometry = geometry_by_link[link_index]
-                points = candidate_paths[link_index]
-                geometry["points"] = points
-                geometry["label_position"] = label_position(points)
-                if role == "pred":
-                    geometry["start"] = (
-                        float(geometry["start"][0]),
-                        float(geometry["start"][1]) + shift,
-                    )
-                else:
-                    geometry["base"] = (
-                        float(geometry["base"][0]),
-                        float(geometry["base"][1]) + shift,
-                    )
-                    geometry["tip"] = (
-                        float(geometry["tip"][0]),
-                        float(geometry["tip"][1]) + shift,
-                    )
-                endpoint_group_spread_links.add(link_index)
-            endpoint_group_spread_adjustments += 1
-
         return geometry_by_link, {
             "direct_links": len(direct_geometry),
             "routed_links": len(routed_links),
@@ -2561,11 +1899,7 @@ class EzdxfAonWriter:
             "forced_detour_links": forced_detour_links,
             "deoverlap_links": deoverlap_links,
             "node_avoidance_links": node_avoidance_links,
-            "between_node_corridor_links": between_node_corridor_links,
             "post_simplified_links": post_simplified_links,
-            "preferred_between_cleanup_links": preferred_between_cleanup_links,
-            "endpoint_group_spread_adjustments": endpoint_group_spread_adjustments,
-            "endpoint_group_spread_links": len(endpoint_group_spread_links),
             "upper_channel_links": sum(
                 int(base[link.index].get("channel_direction", 0)) > 0
                 and geometry_by_link[link.index].get("route_mode") == "detour"

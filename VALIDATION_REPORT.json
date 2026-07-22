@@ -1,28 +1,30 @@
 {
-  "application_version": "1.7.6",
+  "application_version": "1.7.7",
   "tested_input": "Microsoft Project XML supplied for the Hsinchu Hukou project",
   "source_mode_test": "passed",
-  "windows_packaged_runtime_test": "pending GitHub Actions Windows build",
+  "packaged_runtime_test": "passed",
   "result": {
     "tasks": 553,
     "links": 599,
     "critical_tasks": 39,
-    "direct_links": 173,
-    "routed_links": 426,
-    "two_turn_links": 72,
-    "between_node_corridor_links": 82,
-    "preferred_between_cleanup_links": 8,
-    "endpoint_group_spread_adjustments": 104,
-    "same_period_components_reordered": 30,
-    "non_orthogonal_segments": 0,
-    "short_endpoint_stubs": 0,
+    "direct_links": 178,
+    "two_turn_links": 59,
+    "four_turn_links": 362,
+    "final_layout_review_moves": 85,
+    "horizontal_fs_before_review": 183,
+    "horizontal_fs_after_review": 196,
+    "crossing_proxy_before_review": 346,
+    "crossing_proxy_after_review": 252,
+    "vertical_reversals_before_review": 168,
+    "vertical_reversals_after_review": 166,
     "dxf_version": "AC1024 / R2010",
     "dxf_audit_errors": 0,
-    "one_link_object_per_relationship": true
+    "one_link_object_per_relationship": true,
+    "remaining_non_ascii_text_entities": 0
   },
   "notes": [
-    "The complete 553-task and 599-link source graph was routed and written to a temporary DXF.",
-    "The temporary DXF was reopened with ezdxf and passed both write-time and readback audits with zero errors.",
-    "The GitHub Actions workflow builds the Windows x64 portable package on a Windows runner."
+    "The packaged-runtime test was executed in the available Linux build environment.",
+    "The included PyInstaller specification, Windows CMD builder, and GitHub Actions workflow target Windows x64.",
+    "A Windows executable must be built on a Windows runner; PyInstaller does not cross-compile Windows executables from Linux."
   ]
 }
