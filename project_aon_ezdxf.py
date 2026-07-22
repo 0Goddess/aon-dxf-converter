@@ -504,6 +504,8 @@ def enlarge_layout(layout: DrawingLayout, time_scale: str = "month") -> DrawingL
     # Critical activities stay on row zero and no activity changes its X/time
     # position.
     layout_review_moves = 0
+    whole_chain_review_moves = 0
+    whole_chains_aligned = 0
     review_links = [
         link
         for link in layout.links
@@ -572,6 +574,118 @@ def enlarge_layout(layout: DrawingLayout, time_scale: str = "month") -> DrawingL
         return horizontal, crossings, reversals
 
     review_before = review_metrics()
+
+    # Review complete non-critical FS chains before individual activities.
+    # Moving one activity at a time cannot clear an occupied destination row
+    # and often leaves an otherwise straight sequence split across lanes.  A
+    # chain candidate is therefore evaluated as one layout operation, with
+    # drawing-wide crossings as the primary score and horizontal continuity as
+    # the next criterion.  X/time coordinates never change.
+    fs_predecessors: dict[int, list[int]] = collections.defaultdict(list)
+    fs_successors: dict[int, list[int]] = collections.defaultdict(list)
+    for link in review_links:
+        if link.pred_uid in critical_uids or link.succ_uid in critical_uids:
+            continue
+        fs_predecessors[link.succ_uid].append(link.pred_uid)
+        fs_successors[link.pred_uid].append(link.succ_uid)
+
+    chain_starts = sorted(
+        (
+            uid
+            for uid in layout.nodes
+            if uid not in critical_uids
+            and len(fs_successors.get(uid, [])) == 1
+            and len(fs_predecessors.get(uid, [])) != 1
+        ),
+        key=lambda uid: (layout.nodes[uid].task.rank, layout.nodes[uid].task.task_id),
+    )
+    review_chains: list[list[int]] = []
+    claimed_chain_uids: set[int] = set()
+    for start_uid in chain_starts:
+        chain = [start_uid]
+        current_uid = start_uid
+        while len(fs_successors.get(current_uid, [])) == 1:
+            next_uid = fs_successors[current_uid][0]
+            if next_uid in critical_uids or len(fs_predecessors.get(next_uid, [])) != 1:
+                break
+            if next_uid in chain:
+                break
+            chain.append(next_uid)
+            current_uid = next_uid
+        if len(chain) >= 2 and not claimed_chain_uids.intersection(chain):
+            review_chains.append(chain)
+            claimed_chain_uids.update(chain)
+
+    def review_global_score() -> tuple[int, int, int, int]:
+        horizontal, crossings, reversals = review_metrics()
+        vertical_span = sum(
+            abs(
+                layout.nodes[link.pred_uid].task.row
+                - layout.nodes[link.succ_uid].task.row
+            )
+            for link in review_links
+        )
+        return crossings, -horizontal, reversals, vertical_span
+
+    max_review_row = max(abs(node.task.row) for node in layout.nodes.values())
+    occupied = {
+        (round(node.x, 6), node.task.row): uid
+        for uid, node in layout.nodes.items()
+    }
+    for _ in range(4):
+        chain_changed = False
+        for chain in sorted(review_chains, key=lambda item: (-len(item), layout.nodes[item[0]].task.task_id)):
+            original_rows = {uid: layout.nodes[uid].task.row for uid in chain}
+            current_score = review_global_score()
+            candidate_rows = {
+                row
+                for row in range(-max_review_row - 2, max_review_row + 3)
+                if row != 0
+            }
+            candidate_rows.update(original_rows.values())
+            feasible_rows = []
+            for candidate_row in candidate_rows:
+                if all(
+                    (owner := occupied.get((round(layout.nodes[uid].x, 6), candidate_row)))
+                    is None
+                    or owner in chain
+                    for uid in chain
+                ):
+                    feasible_rows.append(candidate_row)
+            best_row = None
+            best_score = current_score
+            best_ranked = current_score + (
+                min(abs(row) for row in original_rows.values()),
+                min(original_rows.values()),
+            )
+            for candidate_row in feasible_rows:
+                for uid in chain:
+                    layout.nodes[uid].task.row = candidate_row
+                    layout.nodes[uid].y = candidate_row * Y_SPACING
+                candidate_score = review_global_score()
+                ranked = candidate_score + (abs(candidate_row), candidate_row)
+                if ranked < best_ranked:
+                    best_row = candidate_row
+                    best_score = candidate_score
+                    best_ranked = ranked
+                for uid, original_row in original_rows.items():
+                    layout.nodes[uid].task.row = original_row
+                    layout.nodes[uid].y = original_row * Y_SPACING
+            if best_row is None:
+                continue
+            for uid, original_row in original_rows.items():
+                occupied.pop((round(layout.nodes[uid].x, 6), original_row), None)
+            for uid in chain:
+                layout.nodes[uid].task.row = best_row
+                layout.nodes[uid].y = best_row * Y_SPACING
+                occupied[(round(layout.nodes[uid].x, 6), best_row)] = uid
+            whole_chain_review_moves += sum(
+                original_row != best_row for original_row in original_rows.values()
+            )
+            whole_chains_aligned += 1
+            chain_changed = True
+        if not chain_changed:
+            break
 
     def review_local_cost(uid: int, candidate_row: int) -> float:
         affected = incident_links.get(uid, [])
@@ -672,6 +786,8 @@ def enlarge_layout(layout: DrawingLayout, time_scale: str = "month") -> DrawingL
         "time_periods": len(periods),
         "time_scale": scale,
         "final_layout_review_moves": layout_review_moves,
+        "whole_chain_review_moves": whole_chain_review_moves,
+        "whole_chains_aligned": whole_chains_aligned,
         "horizontal_fs_before_review": review_before[0],
         "horizontal_fs_after_review": review_after[0],
         "crossing_proxy_before_review": review_before[1],

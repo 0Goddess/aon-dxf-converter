@@ -1,5 +1,5 @@
 {
-  "application_version": "1.7.7",
+  "application_version": "1.7.8",
   "tested_input": "Microsoft Project XML supplied for the Hsinchu Hukou project",
   "source_mode_test": "passed",
   "packaged_runtime_test": "passed",
@@ -12,9 +12,9 @@
     "four_turn_links": 362,
     "final_layout_review_moves": 85,
     "horizontal_fs_before_review": 183,
-    "horizontal_fs_after_review": 196,
+    "horizontal_fs_after_review": 198,
     "crossing_proxy_before_review": 346,
-    "crossing_proxy_after_review": 252,
+    "crossing_proxy_after_review": 171,
     "vertical_reversals_before_review": 168,
     "vertical_reversals_after_review": 166,
     "dxf_version": "AC1024 / R2010",

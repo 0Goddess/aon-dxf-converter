@@ -12,3 +12,4 @@ This application is distributed with or built using the following projects:
 The complete SIL Open Font License text for the bundled font is included at
 assets/OFL-1.1.txt in the source package and inside the packaged application.
 
+
