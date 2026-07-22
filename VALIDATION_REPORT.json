@@ -1,30 +1,26 @@
 {
-  "application_version": "1.7.8",
-  "tested_input": "Microsoft Project XML supplied for the Hsinchu Hukou project",
+  "application_version": "1.7.9",
   "source_mode_test": "passed",
-  "packaged_runtime_test": "passed",
-  "result": {
-    "tasks": 553,
-    "links": 599,
-    "critical_tasks": 39,
-    "direct_links": 178,
-    "two_turn_links": 59,
-    "four_turn_links": 362,
-    "final_layout_review_moves": 85,
-    "horizontal_fs_before_review": 183,
-    "horizontal_fs_after_review": 198,
-    "crossing_proxy_before_review": 346,
-    "crossing_proxy_after_review": 171,
-    "vertical_reversals_before_review": 168,
-    "vertical_reversals_after_review": 166,
-    "dxf_version": "AC1024 / R2010",
-    "dxf_audit_errors": 0,
-    "one_link_object_per_relationship": true,
-    "remaining_non_ascii_text_entities": 0
+  "windows_packaged_runtime_test": "pending GitHub Actions Windows build",
+  "large_project_regression_test": "pending original Microsoft Project XML",
+  "synthetic_geometry_result": {
+    "python_syntax": "passed",
+    "orthogonal_segments": "passed",
+    "minimum_non_direct_source_stub": 28.0,
+    "minimum_non_direct_target_stub": 28.0,
+    "branch_chain_alignment": "passed",
+    "one_link_object_per_relationship": true
   },
+  "restored_regression_guards": [
+    "minimum 28-unit horizontal source and target stubs",
+    "between-node corridor routing",
+    "same-source branch separation",
+    "late endpoint-group spacing cleanup",
+    "whole FS chain row review",
+    "orthogonal H-V-H crossing proxy"
+  ],
   "notes": [
-    "The packaged-runtime test was executed in the available Linux build environment.",
-    "The included PyInstaller specification, Windows CMD builder, and GitHub Actions workflow target Windows x64.",
-    "A Windows executable must be built on a Windows runner; PyInstaller does not cross-compile Windows executables from Linux."
+    "The full 553-task and 599-link regression input is not present in this workspace.",
+    "The included workflow builds and packages the Windows x64 executable on GitHub Actions."
   ]
 }
