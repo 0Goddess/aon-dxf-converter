@@ -1107,11 +1107,8 @@ class EzdxfAonWriter:
         for link in self.layout.links:
             source_side, _ = self.endpoint_sides(link)
             all_source_endpoints[(link.pred_uid, source_side)].append(link)
+        global_source_port_y: dict[int, float] = {}
         for (uid, _), links in all_source_endpoints.items():
-            if not any(link.index in direct_level for link in links):
-                continue
-            if not any(link.index not in direct_level for link in links):
-                continue
             ordered = sorted(
                 links,
                 key=lambda link: (
@@ -1126,6 +1123,7 @@ class EzdxfAonWriter:
                 for index in range(len(ordered))
             ]
             for link, level in zip(ordered, levels):
+                global_source_port_y[link.index] = level
                 if link.index in direct_level:
                     direct_level[link.index] = level
 
@@ -1244,6 +1242,12 @@ class EzdxfAonWriter:
                     node_top - NODE_HEIGHT + 4.0,
                     min(node_top - 4.0, level + jitter),
                 )
+                if role == "pred":
+                    # The source-side port has already been assigned from the
+                    # complete successor order, including direct horizontal
+                    # relationships.  Never let the routed-only endpoint pool
+                    # overwrite that global rank.
+                    adjusted_level = global_source_port_y[link_index]
                 port_y[(link_index, role)] = adjusted_level
                 port_slot[(link_index, role)] = slot
                 port_count[(link_index, role)] = count
