@@ -1,14 +1,16 @@
 {
-  "application_version": "1.7.15",
+  "application_version": "1.8.0",
   "source_mode_test": "passed",
   "windows_packaged_runtime_test": "pending GitHub Actions Windows build",
-  "large_project_regression_test": "pending original Microsoft Project XML",
+  "large_project_regression_test": "original schedule parsed: 553 tasks / 599 links; full DXF conversion intentionally not run",
   "synthetic_geometry_result": {
     "python_syntax": "passed",
     "orthogonal_segments": "passed",
     "minimum_non_direct_source_stub": 28.0,
     "minimum_non_direct_target_stub": 28.0,
     "branch_chain_alignment": "passed",
+    "downstream_workload_mainline_tiebreak": "passed",
+    "v1_7_15_primary_layout_priorities_preserved": true,
     "row_permutation_crossing_reduction": "passed",
     "zero_crossing_candidate_priority": "passed",
     "single_source_four_way_fanout_crossings": 0,
@@ -55,9 +57,10 @@
     ,"Y-direction overshoot and return rejection"
     ,"safe H-V-H preference over additional staircase bends"
     ,"single global source-port map shared by direct and routed relationships"
+    ,"downstream workload used only after all v1.7.15 primary chain preferences tie"
   ],
   "notes": [
-    "The full 553-task and 599-link regression input is not present in this workspace.",
+    "The original regression input was parsed successfully as 553 tasks and 599 links; no DXF was emitted.",
     "The included workflow builds and packages the Windows x64 executable on GitHub Actions."
   ]
 }

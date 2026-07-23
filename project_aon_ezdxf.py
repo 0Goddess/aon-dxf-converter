@@ -164,6 +164,30 @@ def enlarge_layout(layout: DrawingLayout, time_scale: str = "month") -> DrawingL
             continue
         adjacency[link.pred_uid].append(link.succ_uid)
 
+    # Measure the complete reachable branch, not only the immediate number of
+    # successors.  At a branch, the route carrying more downstream work is the
+    # preferred non-critical horizontal mainline.  This changes only matching
+    # preference; all later crossing, collision and routing checks remain the
+    # acceptance authority.
+    downstream_members: dict[int, frozenset[int]] = {}
+
+    def reachable_downstream(uid: int) -> frozenset[int]:
+        cached = downstream_members.get(uid)
+        if cached is not None:
+            return cached
+        members: set[int] = set()
+        for successor in adjacency.get(uid, []):
+            members.add(successor)
+            members.update(reachable_downstream(successor))
+        result = frozenset(members)
+        downstream_members[uid] = result
+        return result
+
+    downstream_count = {
+        uid: len(reachable_downstream(uid))
+        for uid in layout.nodes
+    }
+
     for pred_uid, successors in adjacency.items():
         pred = layout.nodes[pred_uid].task
         successors.sort(
@@ -172,6 +196,7 @@ def enlarge_layout(layout: DrawingLayout, time_scale: str = "month") -> DrawingL
                 pred.zone != layout.nodes[uid].task.zone,
                 not (pred.critical and layout.nodes[uid].task.critical),
                 abs(pred.task_id - layout.nodes[uid].task.task_id),
+                -downstream_count[uid],
                 uid,
             )
         )
@@ -220,6 +245,15 @@ def enlarge_layout(layout: DrawingLayout, time_scale: str = "month") -> DrawingL
                 matching_size += 1
 
     selected_successor = {uid: successor for uid, successor in match_left.items() if successor is not None}
+    # Keep the proven v1.7.15 matching algorithm and all of its primary
+    # preferences.  Downstream size is only a final tie-break before UID, so it
+    # cannot displace a successor that wins on chronology, zone or task order.
+    downstream_mainline_choices = sum(
+        len(adjacency.get(uid, [])) > 1
+        and downstream_count[successor]
+        == max(downstream_count[candidate] for candidate in adjacency[uid])
+        for uid, successor in selected_successor.items()
+    )
     selected_incoming = set(selected_successor.values())
     chains: list[list[int]] = []
     for start_uid in layout.nodes:
@@ -858,6 +892,7 @@ def enlarge_layout(layout: DrawingLayout, time_scale: str = "month") -> DrawingL
 
     layout.optimization_stats = {
         "matched_fs_links": matching_size,
+        "downstream_mainline_choices": downstream_mainline_choices,
         "chains": len(chains),
         "rows": max(row_assignment.values()) + 1,
         "group_rows": group_row_counts,
