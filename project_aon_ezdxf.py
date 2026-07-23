@@ -128,7 +128,12 @@ def resolve_time_scale(layout: DrawingLayout, requested: str) -> str:
     return "year"
 
 
-def enlarge_layout(layout: DrawingLayout, time_scale: str = "month") -> DrawingLayout:
+def enlarge_layout(
+    layout: DrawingLayout,
+    time_scale: str = "month",
+    *,
+    downstream_priority: bool = True,
+) -> DrawingLayout:
     """Lay out tasks by a user-selectable dominant time period."""
     scale = resolve_time_scale(layout, time_scale)
     task_period = (
@@ -192,12 +197,22 @@ def enlarge_layout(layout: DrawingLayout, time_scale: str = "month") -> DrawingL
         pred = layout.nodes[pred_uid].task
         successors.sort(
             key=lambda uid: (
-                -downstream_count[uid],
-                period_index[task_period[uid]] - period_index[task_period[pred_uid]],
-                pred.zone != layout.nodes[uid].task.zone,
-                not (pred.critical and layout.nodes[uid].task.critical),
-                abs(pred.task_id - layout.nodes[uid].task.task_id),
-                uid,
+                (
+                    -downstream_count[uid],
+                    period_index[task_period[uid]] - period_index[task_period[pred_uid]],
+                    pred.zone != layout.nodes[uid].task.zone,
+                    not (pred.critical and layout.nodes[uid].task.critical),
+                    abs(pred.task_id - layout.nodes[uid].task.task_id),
+                    uid,
+                )
+                if downstream_priority
+                else (
+                    period_index[task_period[uid]] - period_index[task_period[pred_uid]],
+                    pred.zone != layout.nodes[uid].task.zone,
+                    not (pred.critical and layout.nodes[uid].task.critical),
+                    abs(pred.task_id - layout.nodes[uid].task.task_id),
+                    uid,
+                )
             )
         )
 

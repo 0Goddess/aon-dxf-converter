@@ -1,5 +1,5 @@
 {
-  "application_version": "1.8.0-TEST2",
+  "application_version": "1.8.0-TEST3",
   "source_mode_test": "passed",
   "windows_packaged_runtime_test": "pending GitHub Actions Windows build",
   "large_project_regression_test": "original schedule parsed: 553 tasks / 599 links; full DXF conversion intentionally not run",
@@ -11,6 +11,8 @@
     "branch_chain_alignment": "passed",
     "downstream_workload_mainline_tiebreak": "passed",
     "blocked_route_dynamic_column_gap": "passed on provided 327-task / 328-link XML; one inserted column resolved the blocked route",
+    "blocked_route_dynamic_row_gap": "passed in adaptive retry logic; maximum two rows per blocked relationship",
+    "blocked_route_stable_layout_fallback": "restores the exact v1.7.15 successor-order priorities without relaxing routing hard rules",
     "v1_7_15_primary_layout_priorities_preserved": false,
     "row_permutation_crossing_reduction": "passed",
     "zero_crossing_candidate_priority": "passed",

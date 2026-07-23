@@ -20,11 +20,11 @@ import ezdxf
 
 from outline_dxf_unicode_text import convert as outline_unicode_text
 from project_aon_converter import build_layout, parse_project
-from project_aon_ezdxf import EzdxfAonWriter, X_SPACING, enlarge_layout
+from project_aon_ezdxf import EzdxfAonWriter, NODE_HEIGHT, X_SPACING, Y_SPACING, enlarge_layout
 
 
 APP_NAME = "Project XML 轉 AON DXF"
-APP_VERSION = "1.8.0-TEST2"
+APP_VERSION = "1.8.0-TEST3"
 OUTPUT_SUFFIX = "_AON全區_AutoCAD2023.dxf"
 
 
@@ -94,6 +94,54 @@ def insert_route_column_gap(layout, link_index: int, gap: float = X_SPACING) -> 
     return True
 
 
+def insert_route_row_gap(layout, link_index: int, gap: float = Y_SPACING) -> bool:
+    """Insert one complete blank row toward the blocked target."""
+    link = next((item for item in layout.links if item.index == link_index), None)
+    if link is None:
+        return False
+    pred = layout.nodes[link.pred_uid]
+    succ = layout.nodes[link.succ_uid]
+    if abs(succ.y - pred.y) < 1e-6:
+        return False
+
+    upward = succ.y > pred.y
+    threshold = succ.y
+    moved = False
+    for node in layout.nodes.values():
+        if upward and node.y >= threshold - 1e-6:
+            node.y += gap
+            node.task.row += 1
+            moved = True
+        elif not upward and node.y <= threshold + 1e-6:
+            node.y -= gap
+            node.task.row -= 1
+            moved = True
+    if not moved:
+        return False
+
+    layout.lane_ranges = {}
+    zones = sorted({node.task.zone for node in layout.nodes.values()})
+    for zone in zones:
+        zone_nodes = [
+            node
+            for node in layout.nodes.values()
+            if node.task.zone == zone and not node.task.critical
+        ]
+        if zone_nodes:
+            layout.lane_ranges[zone] = (
+                max(node.y for node in zone_nodes),
+                min(node.y for node in zone_nodes) - NODE_HEIGHT,
+            )
+    layout.min_y = min(node.y for node in layout.nodes.values()) - NODE_HEIGHT - 110.0
+    layout.max_y = max(node.y for node in layout.nodes.values()) + 250.0
+    layout.height = layout.max_y - layout.min_y
+    stats = getattr(layout, "optimization_stats", None)
+    if isinstance(stats, dict):
+        stats["route_gap_rows"] = stats.get("route_gap_rows", 0) + 1
+        stats.setdefault("route_gap_row_links", []).append(link_index)
+    return True
+
+
 def convert_project(
     xml_path: Path,
     output_directory: Path,
@@ -143,7 +191,8 @@ def convert_project(
         final_temp = temp_root / "AON_FINAL_AUTOCAD2023.dxf"
 
         update(43, f"繪製節點與 {len(layout.links)} 條關係線…")
-        route_gap_attempts: dict[int, int] = {}
+        route_gap_attempts: dict[int, dict[str, int]] = {}
+        stable_layout_fallback = False
         while True:
             try:
                 writer = EzdxfAonWriter(layout)
@@ -153,14 +202,54 @@ def convert_project(
                 if match is None:
                     raise
                 blocked_link = int(match.group(1))
-                attempts = route_gap_attempts.get(blocked_link, 0)
-                if attempts >= 2 or not insert_route_column_gap(layout, blocked_link):
+                if stable_layout_fallback:
                     raise
-                route_gap_attempts[blocked_link] = attempts + 1
+                attempts = route_gap_attempts.setdefault(
+                    blocked_link, {"horizontal": 0, "vertical": 0}
+                )
+                expanded = False
+                # Test both dimensions instead of assuming every blockage is
+                # horizontal: H1 -> V1 -> H2 -> V2.
+                if attempts["horizontal"] == attempts["vertical"] and attempts["horizontal"] < 2:
+                    expanded = insert_route_column_gap(layout, blocked_link)
+                    if expanded:
+                        attempts["horizontal"] += 1
+                        update(
+                            43,
+                            f"關係 {blocked_link} 水平空間不足，插入第 {attempts['horizontal']} 格空白欄後重新排線…",
+                        )
+                if not expanded and attempts["vertical"] < 2:
+                    expanded = insert_route_row_gap(layout, blocked_link)
+                    if expanded:
+                        attempts["vertical"] += 1
+                        update(
+                            43,
+                            f"關係 {blocked_link} 垂直通道不足，插入第 {attempts['vertical']} 格空白列後重新排線…",
+                        )
+                if not expanded and attempts["horizontal"] < 2:
+                    expanded = insert_route_column_gap(layout, blocked_link)
+                    if expanded:
+                        attempts["horizontal"] += 1
+                        update(
+                            43,
+                            f"關係 {blocked_link} 水平空間仍不足，插入第 {attempts['horizontal']} 格空白欄後重新排線…",
+                        )
+                if expanded:
+                    continue
+
+                # The TEST mainline choice itself has sealed the corridor.
+                # Restore the stable v1.8 tie-break layout rather than weaken
+                # any node-clearance, fan-order or line-separation rule.
                 update(
                     43,
-                    f"關係 {blocked_link} 通道封閉，插入第 {attempts + 1} 格空白欄後重新排線…",
+                    f"關係 {blocked_link} 水平與垂直擴距仍無解，回復穩定主線版面…",
                 )
+                layout = enlarge_layout(
+                    build_layout(model, f"{project_name}｜AON全工程網圖", None),
+                    time_scale=time_scale,
+                    downstream_priority=False,
+                )
+                stable_layout_fallback = True
         source_info = writer.save(source_dxf)
         if source_info["audit_errors"]:
             raise RuntimeError("AON 原始 DXF 格式稽核失敗。")
