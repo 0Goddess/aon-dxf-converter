@@ -1,5 +1,5 @@
 {
-  "application_version": "1.7.11",
+  "application_version": "1.7.12",
   "source_mode_test": "passed",
   "windows_packaged_runtime_test": "pending GitHub Actions Windows build",
   "large_project_regression_test": "pending original Microsoft Project XML",
@@ -14,6 +14,10 @@
     "single_source_four_way_fanout_crossings": 0,
     "adjacent_source_group_crossings": 0,
     "postprocess_added_crossings": 0,
+    "bidirectional_seven_link_fanout_crossings": 0,
+    "bidirectional_seven_link_x_reversals": 0,
+    "adjacent_downward_group_crossings": 0,
+    "adjacent_downward_group_x_reversals": 0,
     "node_route_clearance": 12.0,
     "one_link_object_per_relationship": true
   },
@@ -30,6 +34,9 @@
     ,"monotone multi-successor fan-out ordering"
     ,"source-specific vertical corridor bands"
     ,"post-processing proper-crossing rejection"
+    ,"independent upward, same-row, and downward fan-out ranks"
+    ,"inter-row corridor search before drawing-wide outer fallback"
+    ,"X-direction reversal scoring and post-processing guard"
   ],
   "notes": [
     "The full 553-task and 599-link regression input is not present in this workspace.",
