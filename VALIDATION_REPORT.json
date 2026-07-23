@@ -1,5 +1,5 @@
 {
-  "application_version": "1.7.12",
+  "application_version": "1.7.13",
   "source_mode_test": "passed",
   "windows_packaged_runtime_test": "pending GitHub Actions Windows build",
   "large_project_regression_test": "pending original Microsoft Project XML",
@@ -18,6 +18,9 @@
     "bidirectional_seven_link_x_reversals": 0,
     "adjacent_downward_group_crossings": 0,
     "adjacent_downward_group_x_reversals": 0,
+    "overlapping_adjacent_source_group_x_reversals": 0,
+    "locked_upward_fan_bend_order": "passed",
+    "long_multirow_corridor_x_reversals": 0,
     "node_route_clearance": 12.0,
     "one_link_object_per_relationship": true
   },
@@ -37,6 +40,9 @@
     ,"independent upward, same-row, and downward fan-out ranks"
     ,"inter-row corridor search before drawing-wide outer fallback"
     ,"X-direction reversal scoring and post-processing guard"
+    ,"overlapping-span regional fan grouping"
+    ,"locked source-bend order through final post-processing"
+    ,"hard-clearance final routing fallback"
   ],
   "notes": [
     "The full 553-task and 599-link regression input is not present in this workspace.",

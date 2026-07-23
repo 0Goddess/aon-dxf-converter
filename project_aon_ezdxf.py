@@ -1264,30 +1264,64 @@ class EzdxfAonWriter:
             for position, link in enumerate(ordered_links):
                 fan_turn_rank[link.index] = position
 
-        source_columns: dict[
-            tuple[str, float, int], list[tuple[int, str, int]]
-        ] = collections.defaultdict(list)
+        source_band_base: dict[tuple[int, str, int], float] = collections.defaultdict(float)
+        # Build regional competition groups from overlapping horizontal fan
+        # spans, not only identical source X coordinates.  Two nearby sources
+        # whose candidate corridors cover the same X range must coordinate
+        # their vertical bands even when their nodes occupy adjacent columns.
+        fan_records: list[
+            tuple[tuple[int, str, int], str, int, float, float, float]
+        ] = []
         for key, group_links in directional_source_groups.items():
             if len(group_links) < 2:
                 continue
             uid, side, direction = key
             node = self.layout.nodes[uid]
             source_x = node.x + NODE_WIDTH if side == "R" else node.x
-            source_columns[(side, round(source_x, 6), direction)].append(key)
+            target_xs = []
+            for link in group_links:
+                _, target_side = self.endpoint_sides(link)
+                target = self.layout.nodes[link.succ_uid]
+                target_xs.append(
+                    target.x if target_side == "L" else target.x + NODE_WIDTH
+                )
+            low = min([source_x] + target_xs) - MIN_ENDPOINT_STUB_LENGTH
+            high = max([source_x] + target_xs) + MIN_ENDPOINT_STUB_LENGTH
+            fan_records.append((key, side, direction, low, high, node.y))
 
-        source_band_base: dict[tuple[int, str, int], float] = collections.defaultdict(float)
-        for (side, _, direction), column_groups in source_columns.items():
+        regional_clusters: list[
+            list[tuple[tuple[int, str, int], str, int, float, float, float]]
+        ] = []
+        for record in sorted(fan_records, key=lambda item: (item[1], item[2], item[3], -item[5])):
+            _, side, direction, low, high, source_y = record
+            matching_cluster = None
+            for cluster in regional_clusters:
+                first = cluster[0]
+                if first[1] != side or first[2] != direction:
+                    continue
+                cluster_low = min(item[3] for item in cluster)
+                cluster_high = max(item[4] for item in cluster)
+                vertically_near = any(
+                    abs(source_y - item[5]) <= 4.0 * Y_SPACING
+                    for item in cluster
+                )
+                if vertically_near and min(high, cluster_high) >= max(low, cluster_low):
+                    matching_cluster = cluster
+                    break
+            if matching_cluster is None:
+                regional_clusters.append([record])
+            else:
+                matching_cluster.append(record)
+
+        for cluster in regional_clusters:
+            direction = cluster[0][2]
             cursor = 0.0
-            # For upward groups the upper source owns the inner band; for
-            # downward groups the lower source owns it.  This mirrored order
-            # prevents one source trunk from cutting through the other
-            # source's horizontal fan-out.
             reverse = direction >= 0
-            for key in sorted(
-                column_groups,
+            for key, _, _, _, _, _ in sorted(
+                cluster,
                 key=lambda item: (
-                    self.layout.nodes[item[0]].y,
-                    self.layout.nodes[item[0]].task.task_id,
+                    item[5],
+                    self.layout.nodes[item[0][0]].task.task_id,
                 ),
                 reverse=reverse,
             ):
@@ -1640,6 +1674,38 @@ class EzdxfAonWriter:
                 and ((second[0] > first[0]) - (second[0] < first[0])) != overall
             )
 
+        def first_vertical_x(
+            points: list[tuple[float, float]],
+        ) -> float | None:
+            for first, second in orthogonal_segments(points):
+                if math.isclose(first[0], second[0], abs_tol=1e-6):
+                    return first[0]
+            return None
+
+        def source_fan_is_locked(link: Link) -> bool:
+            source_side, _ = self.endpoint_sides(link)
+            key = (
+                link.pred_uid,
+                source_side,
+                fan_direction.get(link.index, 0),
+            )
+            return len(directional_source_groups.get(key, [])) >= 2
+
+        def preserves_locked_source_bend(
+            link: Link,
+            candidate: list[tuple[float, float]],
+            current: list[tuple[float, float]],
+        ) -> bool:
+            if not source_fan_is_locked(link):
+                return True
+            candidate_x = first_vertical_x(candidate)
+            current_x = first_vertical_x(current)
+            return (
+                candidate_x is not None
+                and current_x is not None
+                and math.isclose(candidate_x, current_x, abs_tol=1e-6)
+            )
+
         def label_position(points: list[tuple[float, float]]) -> tuple[float, float]:
             horizontal = [
                 (abs(second[0] - first[0]), first, second)
@@ -1686,6 +1752,23 @@ class EzdxfAonWriter:
             arrow_base = (float(geometry["base"][0]), float(geometry["base"][1]))
             source_shift = 1 if geometry["source_side"] == "R" else -1
             target_shift = -int(geometry["arrow_direction"])
+            direction_key = fan_direction.get(link.index, 0)
+            fan_key = (
+                link.pred_uid,
+                str(geometry["source_side"]),
+                direction_key,
+            )
+            locked_source_fan = len(
+                directional_source_groups.get(fan_key, [])
+            ) >= 2
+            row_span = abs(
+                self.layout.nodes[link.pred_uid].task.row
+                - self.layout.nodes[link.succ_uid].task.row
+            )
+
+            def source_steps(limit: int) -> range:
+                return range(1) if locked_source_fan else range(limit)
+
             selected_points: list[tuple[float, float]] | None = None
             route_mode = ""
             crossing_fallback: tuple[
@@ -1699,7 +1782,8 @@ class EzdxfAonWriter:
             dogleg_candidates: list[
                 tuple[tuple[int, int, float, int, int], list[tuple[float, float]], str]
             ] = []
-            for step in range(16):
+            source_dogleg_limit = 80 if row_span >= 3 else 16
+            for step in source_steps(source_dogleg_limit):
                 trunk_x = float(geometry["source_bend_x"]) + source_shift * step * MIN_VERTICAL_CHANNEL_SPACING
                 candidate = simplify_points(
                     [start, (trunk_x, start[1]), (trunk_x, arrow_base[1]), arrow_base]
@@ -1719,7 +1803,13 @@ class EzdxfAonWriter:
                         )
                     )
 
-            for step in range(16):
+            source_candidate_count = len(dogleg_candidates)
+            target_dogleg_limit = 80 if row_span >= 3 else 16
+            for step in (
+                range(target_dogleg_limit)
+                if not locked_source_fan or source_candidate_count == 0
+                else ()
+            ):
                 trunk_x = float(geometry["target_bend_x"]) + target_shift * step * MIN_VERTICAL_CHANNEL_SPACING
                 candidate = simplify_points(
                     [start, (trunk_x, start[1]), (trunk_x, arrow_base[1]), arrow_base]
@@ -1763,7 +1853,7 @@ class EzdxfAonWriter:
                 detour_candidates: list[
                     tuple[tuple[int, int, float, int, int, int], list[tuple[float, float]]]
                 ] = []
-                for source_step in range(24):
+                for source_step in source_steps(24):
                     source_x = source_x0 + source_shift * source_step * MIN_VERTICAL_CHANNEL_SPACING
                     for target_step in range(24):
                         target_x = target_x0 + target_shift * target_step * MIN_VERTICAL_CHANNEL_SPACING
@@ -1840,7 +1930,7 @@ class EzdxfAonWriter:
                         ]
                     ] = []
                     for local_y in level_candidates:
-                        for source_step in range(12):
+                        for source_step in source_steps(12):
                             source_x = (
                                 source_x0
                                 + source_shift
@@ -1899,7 +1989,7 @@ class EzdxfAonWriter:
                     # Very high-degree endpoints can have fixed port levels
                     # closer than the preferred spacing.  Keep node avoidance
                     # mandatory and relax only parallel clearance in that case.
-                    for source_step in range(28):
+                    for source_step in source_steps(28):
                         source_x = source_x0 + source_shift * source_step * MIN_VERTICAL_CHANNEL_SPACING
                         for target_step in range(28):
                             target_x = target_x0 + target_shift * target_step * MIN_VERTICAL_CHANNEL_SPACING
@@ -2050,6 +2140,7 @@ class EzdxfAonWriter:
         deoverlap_links = 0
         node_avoidance_links = 0
         between_node_corridor_links = 0
+        locked_fan_relaxation_links = 0
         link_by_index = {link.index: link for link in self.layout.links}
         node_top = max(node.y for node in self.layout.nodes.values())
         node_bottom = min(node.y - NODE_HEIGHT for node in self.layout.nodes.values())
@@ -2204,7 +2295,10 @@ class EzdxfAonWriter:
             link = link_by_index[link_index]
             original = list(geometry["points"])
             simplified = remove_unnecessary_detours(link, original)
-            if not bool(geometry.get("direct")) and not respects_endpoint_stubs(simplified):
+            if (
+                (not bool(geometry.get("direct")) and not respects_endpoint_stubs(simplified))
+                or not preserves_locked_source_bend(link, simplified, original)
+            ):
                 simplified = original
             geometry["points"] = simplified
             geometry["label_position"] = label_position(simplified)
@@ -2251,6 +2345,9 @@ class EzdxfAonWriter:
                 chosen = None
                 chosen_mode = ""
 
+                def keeps_source_fan(candidate: list[tuple[float, float]]) -> bool:
+                    return preserves_locked_source_bend(link, candidate, points)
+
                 # First retry the shortest dogleg with a wider trunk search.
                 # This is the preferred shape for vertically separated nodes:
                 # leave the source horizontally, turn directly toward the
@@ -2262,7 +2359,7 @@ class EzdxfAonWriter:
                     candidate = simplify_points(
                         [start, (trunk_x, start[1]), (trunk_x, arrow_base[1]), arrow_base]
                     )
-                    if respects_endpoint_stubs(candidate) and not path_hits_node(link, candidate) and not overlaps_accepted(candidate) and not crosses_same_source(link, candidate):
+                    if respects_endpoint_stubs(candidate) and not path_hits_node(link, candidate) and not overlaps_accepted(candidate) and not crosses_same_source(link, candidate) and keeps_source_fan(candidate):
                         chosen = candidate
                         break
 
@@ -2342,6 +2439,7 @@ class EzdxfAonWriter:
                                     and not path_hits_node(link, candidate)
                                     and not overlaps_accepted(candidate)
                                     and not crosses_same_source(link, candidate)
+                                    and keeps_source_fan(candidate)
                                 ):
                                     chosen = candidate
                                     chosen_mode = "between_nodes"
@@ -2379,7 +2477,7 @@ class EzdxfAonWriter:
                             arrow_base,
                         ]
                     )
-                    if respects_endpoint_stubs(candidate) and not path_hits_node(link, candidate) and not overlaps_accepted(candidate) and not crosses_same_source(link, candidate):
+                    if respects_endpoint_stubs(candidate) and not path_hits_node(link, candidate) and not overlaps_accepted(candidate) and not crosses_same_source(link, candidate) and keeps_source_fan(candidate):
                         chosen = candidate
                         break
 
@@ -2416,7 +2514,7 @@ class EzdxfAonWriter:
                             arrow_base,
                         ]
                     )
-                    if respects_endpoint_stubs(candidate) and not path_hits_node(link, candidate) and not overlaps_accepted(candidate) and not crosses_same_source(link, candidate):
+                    if respects_endpoint_stubs(candidate) and not path_hits_node(link, candidate) and not overlaps_accepted(candidate) and not crosses_same_source(link, candidate) and keeps_source_fan(candidate):
                         chosen = candidate
                         break
                 if chosen is None:
@@ -2444,7 +2542,7 @@ class EzdxfAonWriter:
                                 arrow_base,
                             ]
                         )
-                        if respects_endpoint_stubs(candidate) and not path_hits_node(link, candidate) and not touches_accepted(candidate) and not crosses_same_source(link, candidate):
+                        if respects_endpoint_stubs(candidate) and not path_hits_node(link, candidate) and not touches_accepted(candidate) and not crosses_same_source(link, candidate) and keeps_source_fan(candidate):
                             chosen = candidate
                             break
                 if chosen is None:
@@ -2495,16 +2593,90 @@ class EzdxfAonWriter:
                                         arrow_base,
                                     ]
                                 )
-                                if respects_endpoint_stubs(candidate) and not path_hits_node(link, candidate) and not touches_accepted(candidate) and not crosses_same_source(link, candidate):
+                                if respects_endpoint_stubs(candidate) and not path_hits_node(link, candidate) and not touches_accepted(candidate) and not crosses_same_source(link, candidate) and keeps_source_fan(candidate):
                                     chosen = candidate
                                     break
                             if chosen is not None:
                                 break
                         if chosen is not None:
                             break
+                if chosen is None:
+                    # Do not abort an otherwise valid drawing merely because
+                    # the preferred same-source visual ordering has no fully
+                    # spaced lane in an exceptionally dense region.  Keep the
+                    # assigned source bend first and relax only that visual
+                    # ordering test; node clearance, endpoint stubs and
+                    # physical separation remain hard requirements.
+                    locked_x = first_vertical_x(points)
+                    side = -1 if arrow_base[1] <= start[1] else 1
+                    local_edge = (
+                        min(start[1], arrow_base[1]) - NODE_HEIGHT
+                        if side < 0
+                        else max(start[1], arrow_base[1])
+                    )
+                    if locked_x is not None:
+                        for attempt in range(1, 801):
+                            outside_y = local_edge + side * (18.0 + attempt * 5.17)
+                            target_x = arrow_base[0] + target_shift * (
+                                12.0 + attempt * 5.31
+                            )
+                            candidate = simplify_points(
+                                [
+                                    start,
+                                    (locked_x, start[1]),
+                                    (locked_x, outside_y),
+                                    (target_x, outside_y),
+                                    (target_x, arrow_base[1]),
+                                    arrow_base,
+                                ]
+                            )
+                            if (
+                                respects_endpoint_stubs(candidate)
+                                and not path_hits_node(link, candidate)
+                                and not touches_accepted(candidate)
+                                and keeps_source_fan(candidate)
+                            ):
+                                chosen = candidate
+                                chosen_mode = "locked_fan_relaxed_order"
+                                locked_fan_relaxation_links += 1
+                                break
+                if chosen is None:
+                    # Absolute safety fallback for pathological congestion:
+                    # search independent source/target trunks.  This may
+                    # relax the fan bend order, but never the geometric hard
+                    # rules, and is preferable to failing the whole export.
+                    side = -1 if arrow_base[1] <= start[1] else 1
+                    local_edge = (
+                        min(start[1], arrow_base[1]) - NODE_HEIGHT
+                        if side < 0
+                        else max(start[1], arrow_base[1])
+                    )
+                    for attempt in range(1, 2001):
+                        outside_y = local_edge + side * (21.0 + attempt * 4.73)
+                        source_x = start[0] + source_shift * (31.0 + attempt * 5.11)
+                        target_x = arrow_base[0] + target_shift * (31.0 + attempt * 5.29)
+                        candidate = simplify_points(
+                            [
+                                start,
+                                (source_x, start[1]),
+                                (source_x, outside_y),
+                                (target_x, outside_y),
+                                (target_x, arrow_base[1]),
+                                arrow_base,
+                            ]
+                        )
+                        if (
+                            respects_endpoint_stubs(candidate)
+                            and not path_hits_node(link, candidate)
+                            and not touches_accepted(candidate)
+                        ):
+                            chosen = candidate
+                            chosen_mode = "hard_clearance_fallback"
+                            locked_fan_relaxation_links += 1
+                            break
                 if chosen is not None:
                     shortened = remove_unnecessary_detours(link, chosen)
-                    if respects_endpoint_stubs(shortened) and not path_hits_node(link, shortened) and not overlaps_accepted(shortened):
+                    if respects_endpoint_stubs(shortened) and not path_hits_node(link, shortened) and not overlaps_accepted(shortened) and keeps_source_fan(shortened):
                         chosen = shortened
                     points = chosen
                     geometry["points"] = points
@@ -2611,6 +2783,7 @@ class EzdxfAonWriter:
                     or path_hits_node(link, candidate)
                     or path_self_intersects(candidate)
                     or path_x_reversals(candidate) > path_x_reversals(current)
+                    or not preserves_locked_source_bend(link, candidate, current)
                 ):
                     continue
                 candidate_segments = orthogonal_segments(candidate)
@@ -2747,6 +2920,7 @@ class EzdxfAonWriter:
                         or path_hits_node(link, candidate)
                         or path_self_intersects(candidate)
                         or path_x_reversals(candidate) > path_x_reversals(current)
+                        or not preserves_locked_source_bend(link, candidate, current)
                     ):
                         continue
                     candidate_segments = orthogonal_segments(candidate)
@@ -3018,6 +3192,7 @@ class EzdxfAonWriter:
             "deoverlap_links": deoverlap_links,
             "node_avoidance_links": node_avoidance_links,
             "between_node_corridor_links": between_node_corridor_links,
+            "locked_fan_relaxation_links": locked_fan_relaxation_links,
             "post_simplified_links": post_simplified_links,
             "preferred_between_cleanup_links": preferred_between_cleanup_links,
             "endpoint_group_spread_adjustments": endpoint_group_spread_adjustments,
