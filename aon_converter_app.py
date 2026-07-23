@@ -20,11 +20,11 @@ import ezdxf
 
 from outline_dxf_unicode_text import convert as outline_unicode_text
 from project_aon_converter import build_layout, parse_project
-from project_aon_ezdxf import EzdxfAonWriter, enlarge_layout
+from project_aon_ezdxf import EzdxfAonWriter, X_SPACING, enlarge_layout
 
 
 APP_NAME = "Project XML 轉 AON DXF"
-APP_VERSION = "1.8.0-TEST"
+APP_VERSION = "1.8.0-TEST2"
 OUTPUT_SUFFIX = "_AON全區_AutoCAD2023.dxf"
 
 
@@ -56,6 +56,42 @@ def safe_stem(value: str) -> str:
 
 def output_path_for(xml_path: Path, output_directory: Path) -> Path:
     return output_directory / f"{safe_stem(xml_path.stem)}{OUTPUT_SUFFIX}"
+
+
+def insert_route_column_gap(layout, link_index: int, gap: float = X_SPACING) -> bool:
+    """Insert one complete blank time column immediately before a blocked target."""
+    link = next((item for item in layout.links if item.index == link_index), None)
+    if link is None:
+        return False
+    pred = layout.nodes[link.pred_uid]
+    succ = layout.nodes[link.succ_uid]
+    if succ.x <= pred.x:
+        return False
+
+    threshold = succ.x
+    moved = False
+    for node in layout.nodes.values():
+        if node.x >= threshold - 1e-6:
+            node.x += gap
+            moved = True
+    if not moved:
+        return False
+
+    layout.time_axis = [
+        (label, center + gap if center >= threshold - 1e-6 else center)
+        for label, center in layout.time_axis
+    ]
+    layout.time_boundaries = [
+        boundary + gap if boundary >= threshold - 1e-6 else boundary
+        for boundary in layout.time_boundaries
+    ]
+    layout.max_x += gap
+    layout.width += gap
+    stats = getattr(layout, "optimization_stats", None)
+    if isinstance(stats, dict):
+        stats["route_gap_columns"] = stats.get("route_gap_columns", 0) + 1
+        stats.setdefault("route_gap_links", []).append(link_index)
+    return True
 
 
 def convert_project(
@@ -107,7 +143,24 @@ def convert_project(
         final_temp = temp_root / "AON_FINAL_AUTOCAD2023.dxf"
 
         update(43, f"繪製節點與 {len(layout.links)} 條關係線…")
-        writer = EzdxfAonWriter(layout)
+        route_gap_attempts: dict[int, int] = {}
+        while True:
+            try:
+                writer = EzdxfAonWriter(layout)
+                break
+            except RuntimeError as error:
+                match = re.fullmatch(r"No clear final route for link (\d+)", str(error))
+                if match is None:
+                    raise
+                blocked_link = int(match.group(1))
+                attempts = route_gap_attempts.get(blocked_link, 0)
+                if attempts >= 2 or not insert_route_column_gap(layout, blocked_link):
+                    raise
+                route_gap_attempts[blocked_link] = attempts + 1
+                update(
+                    43,
+                    f"關係 {blocked_link} 通道封閉，插入第 {attempts + 1} 格空白欄後重新排線…",
+                )
         source_info = writer.save(source_dxf)
         if source_info["audit_errors"]:
             raise RuntimeError("AON 原始 DXF 格式稽核失敗。")
