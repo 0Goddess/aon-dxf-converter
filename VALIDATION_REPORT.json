@@ -1,5 +1,5 @@
 {
-  "application_version": "1.8.0",
+  "application_version": "1.8.0-TEST",
   "source_mode_test": "passed",
   "windows_packaged_runtime_test": "pending GitHub Actions Windows build",
   "large_project_regression_test": "original schedule parsed: 553 tasks / 599 links; full DXF conversion intentionally not run",
@@ -10,7 +10,7 @@
     "minimum_non_direct_target_stub": 28.0,
     "branch_chain_alignment": "passed",
     "downstream_workload_mainline_tiebreak": "passed",
-    "v1_7_15_primary_layout_priorities_preserved": true,
+    "v1_7_15_primary_layout_priorities_preserved": false,
     "row_permutation_crossing_reduction": "passed",
     "zero_crossing_candidate_priority": "passed",
     "single_source_four_way_fanout_crossings": 0,
@@ -57,7 +57,7 @@
     ,"Y-direction overshoot and return rejection"
     ,"safe H-V-H preference over additional staircase bends"
     ,"single global source-port map shared by direct and routed relationships"
-    ,"downstream workload used only after all v1.7.15 primary chain preferences tie"
+    ,"TEST: downstream workload is the primary non-critical successor-chain preference"
   ],
   "notes": [
     "The original regression input was parsed successfully as 553 tasks and 599 links; no DXF was emitted.",

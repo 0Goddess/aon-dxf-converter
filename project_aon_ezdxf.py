@@ -166,9 +166,9 @@ def enlarge_layout(layout: DrawingLayout, time_scale: str = "month") -> DrawingL
 
     # Measure the complete reachable branch, not only the immediate number of
     # successors.  At a branch, the route carrying more downstream work is the
-    # preferred non-critical horizontal mainline.  This changes only matching
-    # preference; all later crossing, collision and routing checks remain the
-    # acceptance authority.
+    # preferred non-critical horizontal mainline.  In the TEST build this is a
+    # general chain rule rather than a final tie-break; all later crossing,
+    # collision and routing checks remain the acceptance authority.
     downstream_members: dict[int, frozenset[int]] = {}
 
     def reachable_downstream(uid: int) -> frozenset[int]:
@@ -192,11 +192,11 @@ def enlarge_layout(layout: DrawingLayout, time_scale: str = "month") -> DrawingL
         pred = layout.nodes[pred_uid].task
         successors.sort(
             key=lambda uid: (
+                -downstream_count[uid],
                 period_index[task_period[uid]] - period_index[task_period[pred_uid]],
                 pred.zone != layout.nodes[uid].task.zone,
                 not (pred.critical and layout.nodes[uid].task.critical),
                 abs(pred.task_id - layout.nodes[uid].task.task_id),
-                -downstream_count[uid],
                 uid,
             )
         )
@@ -245,9 +245,8 @@ def enlarge_layout(layout: DrawingLayout, time_scale: str = "month") -> DrawingL
                 matching_size += 1
 
     selected_successor = {uid: successor for uid, successor in match_left.items() if successor is not None}
-    # Keep the proven v1.7.15 matching algorithm and all of its primary
-    # preferences.  Downstream size is only a final tie-break before UID, so it
-    # cannot displace a successor that wins on chronology, zone or task order.
+    # Keep the proven v1.7.15 maximum-matching algorithm, but let downstream
+    # workload lead successor preference in this TEST build.
     downstream_mainline_choices = sum(
         len(adjacency.get(uid, [])) > 1
         and downstream_count[successor]
