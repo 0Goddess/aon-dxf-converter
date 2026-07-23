@@ -1180,6 +1180,28 @@ class EzdxfAonWriter:
                         )
                         available.remove(closest)
                 pool = sorted(available[:count], reverse=True)
+                # When every routed counterpart is on one side of a reserved
+                # direct relationship, keep every routed port on that same
+                # side.  Merely removing the nearest generic pool slot can
+                # leave one upper branch below the direct line, forcing an
+                # immediate crossing at the source.
+                node_bottom = node_top - NODE_HEIGHT
+                if prefer_upper_ports:
+                    low = max(reserved) + 4.0
+                    high = node_top - 4.0
+                    if high - low >= max(4.0, count * 3.0):
+                        pool = [
+                            high - (index + 1) * (high - low) / (count + 1)
+                            for index in range(count)
+                        ]
+                elif prefer_lower_ports:
+                    high = min(reserved) - 4.0
+                    low = node_bottom + 4.0
+                    if high - low >= max(4.0, count * 3.0):
+                        pool = [
+                            high - (index + 1) * (high - low) / (count + 1)
+                            for index in range(count)
+                        ]
             for slot, ((link_index, role, _), level) in enumerate(zip(ordered, pool)):
                 # Nearby nodes often generate identical port elevations.  A
                 # small deterministic offset prevents exact endpoint overlap
@@ -1193,6 +1215,57 @@ class EzdxfAonWriter:
                 port_y[(link_index, role)] = adjusted_level
                 port_slot[(link_index, role)] = slot
                 port_count[(link_index, role)] = count
+
+        # Plan source fan-outs as groups.  Target order controls both the port
+        # elevation and a monotone staircase of vertical bends: higher targets
+        # use higher ports and a bend farther from the source.  Nearby source
+        # nodes in the same time column receive non-overlapping X corridor
+        # bands so their fan-outs cannot interleave.
+        source_groups: dict[tuple[int, str], list[Link]] = collections.defaultdict(list)
+        for link in routed_links:
+            source_side, _ = self.endpoint_sides(link)
+            source_groups[(link.pred_uid, source_side)].append(link)
+
+        fan_turn_rank: dict[int, int] = {}
+        for group_links in source_groups.values():
+            ordered_links = sorted(
+                group_links,
+                key=lambda item: (
+                    -self.layout.nodes[item.succ_uid].y,
+                    self.layout.nodes[item.succ_uid].task.task_id,
+                    item.index,
+                ),
+            )
+            for position, link in enumerate(ordered_links):
+                # For rightward fan-out the upper target turns first (closer
+                # to the source), and each lower target turns farther out.
+                # The sign applied later mirrors the same rule for left ports.
+                fan_turn_rank[link.index] = position
+
+        source_columns: dict[tuple[str, float], list[tuple[int, str]]] = collections.defaultdict(list)
+        for key, group_links in source_groups.items():
+            if len(group_links) < 2:
+                continue
+            uid, side = key
+            node = self.layout.nodes[uid]
+            source_x = node.x + NODE_WIDTH if side == "R" else node.x
+            source_columns[(side, round(source_x, 6))].append(key)
+
+        source_band_base: dict[tuple[int, str], float] = collections.defaultdict(float)
+        for column_groups in source_columns.values():
+            cursor = 0.0
+            for key in sorted(
+                column_groups,
+                key=lambda item: (
+                    -self.layout.nodes[item[0]].y,
+                    self.layout.nodes[item[0]].task.task_id,
+                ),
+            ):
+                source_band_base[key] = cursor
+                cursor += (
+                    max(1, len(source_groups[key])) * ENDPOINT_CHANNEL_STEP
+                    + PREFERRED_VERTICAL_CHANNEL_SPACING
+                )
 
         base: dict[int, dict[str, object]] = dict(direct_geometry)
         for link in routed_links:
@@ -1213,7 +1286,8 @@ class EzdxfAonWriter:
             )
             source_offset = (
                 MIN_ENDPOINT_STUB_LENGTH
-                + port_slot[(link.index, "pred")] * source_spacing
+                + source_band_base[(link.pred_uid, source_side)]
+                + fan_turn_rank.get(link.index, 0) * source_spacing
             )
             source_bend_x = sx + source_offset * (1 if source_side == "R" else -1)
             channel_direction = -1 if succ.y <= pred.y else 1
@@ -1543,7 +1617,17 @@ class EzdxfAonWriter:
         relaxed_detour_links = 0
         emergency_detour_links = 0
         forced_detour_links = 0
-        for link in sorted(routed_links, key=lambda item: item.index):
+        routed_links_in_fan_order = sorted(
+            routed_links,
+            key=lambda item: (
+                round(self.layout.nodes[item.pred_uid].x, 6),
+                -self.layout.nodes[item.pred_uid].y,
+                self.layout.nodes[item.pred_uid].task.task_id,
+                -fan_turn_rank.get(item.index, 0),
+                item.index,
+            ),
+        )
+        for link in routed_links_in_fan_order:
             geometry = base[link.index]
             start = (float(geometry["start"][0]), float(geometry["start"][1]))
             arrow_base = (float(geometry["base"][0]), float(geometry["base"][1]))
@@ -2371,6 +2455,7 @@ class EzdxfAonWriter:
                 candidate_segments = orthogonal_segments(candidate)
                 if any(
                     physically_touches(segment, other)
+                    or properly_crosses(segment, other)
                     for segment in candidate_segments
                     for other in other_segments
                 ):
@@ -2505,6 +2590,7 @@ class EzdxfAonWriter:
                     candidate_segments = orthogonal_segments(candidate)
                     if any(
                         physically_touches(segment, other)
+                        or properly_crosses(segment, other)
                         for segment in candidate_segments
                         for other in other_segments
                     ):
@@ -2704,13 +2790,17 @@ class EzdxfAonWriter:
                 ]
                 if any(
                     physically_touches(segment, other)
+                    or properly_crosses(segment, other)
                     for _, segment in candidate_all_segments
                     for other in fixed_all_segments
                 ):
                     continue
                 if any(
                     first_index != second_index
-                    and physically_touches(first, second)
+                    and (
+                        physically_touches(first, second)
+                        or properly_crosses(first, second)
+                    )
                     for first_index, first in candidate_all_segments
                     for second_index, second in candidate_all_segments
                 ):
