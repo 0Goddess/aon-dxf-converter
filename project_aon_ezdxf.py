@@ -65,6 +65,8 @@ PREFERRED_VERTICAL_CHANNEL_SPACING = 18.0
 # a horizontal segment.  A vertical channel may never begin on the node edge.
 MIN_ENDPOINT_STUB_LENGTH = 28.0
 ENDPOINT_CHANNEL_STEP = 18.0
+# Non-endpoint work boxes are hard obstacles with a visible safety halo.
+NODE_ROUTE_CLEARANCE = 12.0
 
 
 TIME_SCALE_TITLES = {"week": "週", "month": "月", "quarter": "季", "year": "年"}
@@ -638,37 +640,16 @@ def enlarge_layout(layout: DrawingLayout, time_scale: str = "month") -> DrawingL
         fs_predecessors[link.succ_uid].append(link.pred_uid)
         fs_successors[link.pred_uid].append(link.succ_uid)
 
-    chain_starts = sorted(
-        (
-            uid
-            for uid in layout.nodes
-            if uid not in critical_uids
-            and len(fs_successors.get(uid, [])) == 1
-            and (
-                len(fs_predecessors.get(uid, [])) != 1
-                or len(
-                    fs_successors.get(fs_predecessors[uid][0], [])
-                ) != 1
-            )
-        ),
-        key=lambda uid: (layout.nodes[uid].task.rank, layout.nodes[uid].task.task_id),
-    )
-    review_chains: list[list[int]] = []
-    claimed_chain_uids: set[int] = set()
-    for start_uid in chain_starts:
-        chain = [start_uid]
-        current_uid = start_uid
-        while len(fs_successors.get(current_uid, [])) == 1:
-            next_uid = fs_successors[current_uid][0]
-            if next_uid in critical_uids or len(fs_predecessors.get(next_uid, [])) != 1:
-                break
-            if next_uid in chain:
-                break
-            chain.append(next_uid)
-            current_uid = next_uid
-        if len(chain) >= 2 and not claimed_chain_uids.intersection(chain):
-            review_chains.append(chain)
-            claimed_chain_uids.update(chain)
+    # Reuse the maximum-matching chains built by the first layout pass.  They
+    # remain valid horizontal-chain candidates even when one of their nodes
+    # has an additional incoming or outgoing branch.  The older one-in/one-out
+    # extraction split exactly the branch-plus-main-chain arrangements that
+    # should be reviewed as a single block.
+    review_chains = [
+        [uid for uid in chain if uid not in critical_uids]
+        for chain in chains
+    ]
+    review_chains = [chain for chain in review_chains if len(chain) >= 2]
 
     def review_global_score() -> tuple[int, int, int, int]:
         horizontal, crossings, reversals = review_metrics()
@@ -740,6 +721,49 @@ def enlarge_layout(layout: DrawingLayout, time_scale: str = "month") -> DrawingL
             chain_changed = True
         if not chain_changed:
             break
+
+    # Compare complete row ordering, not chain length, WBS order, or the
+    # original upper/lower position.  Adjacent row exchanges are sufficient
+    # to reach any useful local permutation while keeping the search bounded
+    # on large schedules.  A swap is accepted only when the drawing-wide
+    # orthogonal crossing score improves (then horizontal continuity,
+    # reversals, and vertical span break ties).
+    row_swap_passes = 0
+    row_swap_moves = 0
+    for _ in range(8):
+        rows = sorted({node.task.row for node in layout.nodes.values() if node.task.row != 0})
+        improved = False
+        for first_row, second_row in zip(rows, rows[1:]):
+            first_uids = [uid for uid, node in layout.nodes.items() if node.task.row == first_row]
+            second_uids = [uid for uid, node in layout.nodes.items() if node.task.row == second_row]
+            if not first_uids or not second_uids:
+                continue
+            before = review_global_score()
+            for uid in first_uids:
+                layout.nodes[uid].task.row = second_row
+                layout.nodes[uid].y = second_row * Y_SPACING
+            for uid in second_uids:
+                layout.nodes[uid].task.row = first_row
+                layout.nodes[uid].y = first_row * Y_SPACING
+            after = review_global_score()
+            if after < before:
+                row_swap_moves += len(first_uids) + len(second_uids)
+                row_swap_passes += 1
+                improved = True
+            else:
+                for uid in first_uids:
+                    layout.nodes[uid].task.row = first_row
+                    layout.nodes[uid].y = first_row * Y_SPACING
+                for uid in second_uids:
+                    layout.nodes[uid].task.row = second_row
+                    layout.nodes[uid].y = second_row * Y_SPACING
+        if not improved:
+            break
+
+    occupied = {
+        (round(node.x, 6), node.task.row): uid
+        for uid, node in layout.nodes.items()
+    }
 
     def review_local_cost(uid: int, candidate_row: int) -> float:
         affected = incident_links.get(uid, [])
@@ -842,6 +866,8 @@ def enlarge_layout(layout: DrawingLayout, time_scale: str = "month") -> DrawingL
         "final_layout_review_moves": layout_review_moves,
         "whole_chain_review_moves": whole_chain_review_moves,
         "whole_chains_aligned": whole_chains_aligned,
+        "row_swap_passes": row_swap_passes,
+        "row_swap_moves": row_swap_moves,
         "horizontal_fs_before_review": review_before[0],
         "horizontal_fs_after_review": review_after[0],
         "crossing_proxy_before_review": review_before[1],
@@ -1401,10 +1427,10 @@ class EzdxfAonWriter:
                         return True
                     continue
                 rectangle = (
-                    node.x - 2.0,
-                    node.y - NODE_HEIGHT - 2.0,
-                    node.x + NODE_WIDTH + 2.0,
-                    node.y + 2.0,
+                    node.x - NODE_ROUTE_CLEARANCE,
+                    node.y - NODE_HEIGHT - NODE_ROUTE_CLEARANCE,
+                    node.x + NODE_WIDTH + NODE_ROUTE_CLEARANCE,
+                    node.y + NODE_ROUTE_CLEARANCE,
                 )
                 if any(segment_intersects_rectangle(first, second, rectangle) for first, second in segments):
                     return True
@@ -1453,6 +1479,40 @@ class EzdxfAonWriter:
                 and path_has_channel_clearance(points)
             )
 
+        def path_crossing_count(points: list[tuple[float, float]]) -> int:
+            """Count proper crossings with already accepted relationships.
+
+            Parallel clearance remains a hard condition in path_is_clear().
+            This score covers perpendicular intersections: when any safe
+            zero-crossing candidate exists it outranks every crossing route.
+            """
+            crossings = 0
+            for (a, b) in orthogonal_segments(points):
+                candidate_vertical = math.isclose(a[0], b[0], abs_tol=1e-6)
+                if candidate_vertical:
+                    y_low, y_high = sorted((a[1], b[1]))
+                    for other_y, other_low, other_high in allocated_horizontals:
+                        if (
+                            other_low + 1e-6 < a[0] < other_high - 1e-6
+                            and y_low + 1e-6 < other_y < y_high - 1e-6
+                        ):
+                            crossings += 1
+                else:
+                    x_low, x_high = sorted((a[0], b[0]))
+                    for other_x, other_low, other_high in allocated_verticals:
+                        if (
+                            x_low + 1e-6 < other_x < x_high - 1e-6
+                            and other_low + 1e-6 < a[1] < other_high - 1e-6
+                        ):
+                            crossings += 1
+            return crossings
+
+        def path_length(points: list[tuple[float, float]]) -> float:
+            return sum(
+                abs(second[0] - first[0]) + abs(second[1] - first[1])
+                for first, second in orthogonal_segments(points)
+            )
+
         def label_position(points: list[tuple[float, float]]) -> tuple[float, float]:
             horizontal = [
                 (abs(second[0] - first[0]), first, second)
@@ -1491,32 +1551,59 @@ class EzdxfAonWriter:
             target_shift = -int(geometry["arrow_direction"])
             selected_points: list[tuple[float, float]] | None = None
             route_mode = ""
+            crossing_fallback: tuple[
+                tuple[int, float, int], list[tuple[float, float]], str
+            ] | None = None
 
-            # Source-side trunks match the second reference image most closely.
+            # Enumerate both source- and target-side trunks before selecting a
+            # route.  The previous first-valid policy could keep a short route
+            # with a crossing even though an open zero-crossing corridor was
+            # available a little farther away.
+            dogleg_candidates: list[
+                tuple[tuple[int, float, int, int], list[tuple[float, float]], str]
+            ] = []
             for step in range(16):
                 trunk_x = float(geometry["source_bend_x"]) + source_shift * step * MIN_VERTICAL_CHANNEL_SPACING
                 candidate = simplify_points(
                     [start, (trunk_x, start[1]), (trunk_x, arrow_base[1]), arrow_base]
                 )
                 if path_is_clear(link, candidate):
-                    selected_points = candidate
-                    route_mode = "source_dogleg"
-                    source_dogleg_links += 1
-                    break
-
-            # If the source side is blocked, try the same two-turn shape with
-            # the vertical trunk just outside the target side.
-            if selected_points is None:
-                for step in range(16):
-                    trunk_x = float(geometry["target_bend_x"]) + target_shift * step * MIN_VERTICAL_CHANNEL_SPACING
-                    candidate = simplify_points(
-                        [start, (trunk_x, start[1]), (trunk_x, arrow_base[1]), arrow_base]
+                    dogleg_candidates.append(
+                        (
+                            (path_crossing_count(candidate), path_length(candidate), len(candidate), step),
+                            candidate,
+                            "source_dogleg",
+                        )
                     )
-                    if path_is_clear(link, candidate):
-                        selected_points = candidate
-                        route_mode = "target_dogleg"
+
+            for step in range(16):
+                trunk_x = float(geometry["target_bend_x"]) + target_shift * step * MIN_VERTICAL_CHANNEL_SPACING
+                candidate = simplify_points(
+                    [start, (trunk_x, start[1]), (trunk_x, arrow_base[1]), arrow_base]
+                )
+                if path_is_clear(link, candidate):
+                    dogleg_candidates.append(
+                        (
+                            (path_crossing_count(candidate), path_length(candidate), len(candidate), step),
+                            candidate,
+                            "target_dogleg",
+                        )
+                    )
+            if dogleg_candidates:
+                score, candidate_points, candidate_mode = min(dogleg_candidates, key=lambda item: item[0])
+                if score[0] == 0:
+                    selected_points = candidate_points
+                    route_mode = candidate_mode
+                    if route_mode == "source_dogleg":
+                        source_dogleg_links += 1
+                    else:
                         target_dogleg_links += 1
-                        break
+                else:
+                    crossing_fallback = (
+                        (score[0], score[1], score[2]),
+                        candidate_points,
+                        candidate_mode,
+                    )
 
             # Retain the proven upper/lower channel only where a single trunk
             # would cross a node or violate the channel spacing.
@@ -1524,6 +1611,9 @@ class EzdxfAonWriter:
                 track_y = float(geometry["track_y"])
                 source_x0 = float(geometry["source_bend_x"])
                 target_x0 = float(geometry["target_bend_x"])
+                detour_candidates: list[
+                    tuple[tuple[int, float, int, int, int], list[tuple[float, float]]]
+                ] = []
                 for source_step in range(24):
                     source_x = source_x0 + source_shift * source_step * MIN_VERTICAL_CHANNEL_SPACING
                     for target_step in range(24):
@@ -1539,10 +1629,30 @@ class EzdxfAonWriter:
                             ]
                         )
                         if path_is_clear(link, candidate):
-                            selected_points = candidate
-                            break
-                    if selected_points is not None:
-                        break
+                            detour_candidates.append(
+                                (
+                                    (
+                                        path_crossing_count(candidate),
+                                        path_length(candidate),
+                                        len(candidate),
+                                        source_step + target_step,
+                                        abs(source_step - target_step),
+                                    ),
+                                    candidate,
+                                )
+                            )
+                if detour_candidates:
+                    score, candidate_points = min(detour_candidates, key=lambda item: item[0])
+                    if score[0] == 0:
+                        selected_points = candidate_points
+                    else:
+                        fallback = (
+                            (score[0], score[1], score[2]),
+                            candidate_points,
+                            "detour",
+                        )
+                        if crossing_fallback is None or fallback[0] < crossing_fallback[0]:
+                            crossing_fallback = fallback
                 if selected_points is None:
                     # Very high-degree endpoints can have fixed port levels
                     # closer than the preferred spacing.  Keep node avoidance
@@ -1562,9 +1672,18 @@ class EzdxfAonWriter:
                                 ]
                             )
                             if path_is_clear(link, candidate):
-                                selected_points = candidate
-                                relaxed_detour_links += 1
-                                break
+                                crossings = path_crossing_count(candidate)
+                                if crossings == 0:
+                                    selected_points = candidate
+                                    relaxed_detour_links += 1
+                                    break
+                                fallback = (
+                                    (crossings, path_length(candidate), len(candidate)),
+                                    candidate,
+                                    "detour",
+                                )
+                                if crossing_fallback is None or fallback[0] < crossing_fallback[0]:
+                                    crossing_fallback = fallback
                         if selected_points is not None:
                             break
                 if selected_points is None:
@@ -1613,11 +1732,23 @@ class EzdxfAonWriter:
                                 [start, (source_x, start[1]), (source_x, outside_y), (target_x, outside_y), (target_x, arrow_base[1]), arrow_base]
                             )
                             if path_is_clear(link, candidate):
-                                selected_points = candidate
-                                emergency_detour_links += 1
-                                break
+                                crossings = path_crossing_count(candidate)
+                                if crossings == 0:
+                                    selected_points = candidate
+                                    emergency_detour_links += 1
+                                    break
+                                fallback = (
+                                    (crossings, path_length(candidate), len(candidate)),
+                                    candidate,
+                                    "detour",
+                                )
+                                if crossing_fallback is None or fallback[0] < crossing_fallback[0]:
+                                    crossing_fallback = fallback
                         if selected_points is not None:
                             break
+                if selected_points is None and crossing_fallback is not None:
+                    _, selected_points, route_mode = crossing_fallback
+
                 if selected_points is None:
                     # Absolute last resort: preserve a valid relationship
                     # object and complete the drawing instead of aborting the
@@ -1638,8 +1769,8 @@ class EzdxfAonWriter:
                     # Keep the first/last stubs short so a relationship does
                     # not run along the port level of an unrelated nearby
                     # node before turning into its private lane.
-                    source_port_x = start[0] + source_shift * (4.0 + route_jitter)
-                    target_port_x = arrow_base[0] + target_shift * (4.0 + route_jitter)
+                    source_port_x = start[0] + source_shift * MIN_ENDPOINT_STUB_LENGTH
+                    target_port_x = arrow_base[0] + target_shift * MIN_ENDPOINT_STUB_LENGTH
                     selected_points = simplify_points(
                         [
                             start,

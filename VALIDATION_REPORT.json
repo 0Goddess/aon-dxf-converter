@@ -1,5 +1,5 @@
 {
-  "application_version": "1.7.9",
+  "application_version": "1.7.10",
   "source_mode_test": "passed",
   "windows_packaged_runtime_test": "pending GitHub Actions Windows build",
   "large_project_regression_test": "pending original Microsoft Project XML",
@@ -9,6 +9,9 @@
     "minimum_non_direct_source_stub": 28.0,
     "minimum_non_direct_target_stub": 28.0,
     "branch_chain_alignment": "passed",
+    "row_permutation_crossing_reduction": "passed",
+    "zero_crossing_candidate_priority": "passed",
+    "node_route_clearance": 12.0,
     "one_link_object_per_relationship": true
   },
   "restored_regression_guards": [
@@ -18,6 +21,9 @@
     "late endpoint-group spacing cleanup",
     "whole FS chain row review",
     "orthogonal H-V-H crossing proxy"
+    ,"branch-preserving maximum-matching chain review"
+    ,"complete-row swap optimization"
+    ,"zero-crossing route candidate selection"
   ],
   "notes": [
     "The full 553-task and 599-link regression input is not present in this workspace.",
