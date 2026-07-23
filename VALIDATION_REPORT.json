@@ -1,5 +1,5 @@
 {
-  "application_version": "1.7.13",
+  "application_version": "1.7.14",
   "source_mode_test": "passed",
   "windows_packaged_runtime_test": "pending GitHub Actions Windows build",
   "large_project_regression_test": "pending original Microsoft Project XML",
@@ -21,6 +21,10 @@
     "overlapping_adjacent_source_group_x_reversals": 0,
     "locked_upward_fan_bend_order": "passed",
     "long_multirow_corridor_x_reversals": 0,
+    "mixed_up_direct_down_source_port_order": "passed",
+    "mixed_fan_y_reversals": 0,
+    "long_up_down_y_reversals": 0,
+    "adjacent_overlapping_fan_y_reversals": 0,
     "node_route_clearance": 12.0,
     "one_link_object_per_relationship": true
   },
@@ -43,6 +47,10 @@
     ,"overlapping-span regional fan grouping"
     ,"locked source-bend order through final post-processing"
     ,"hard-clearance final routing fallback"
+    ,"global top-to-bottom source-port ordering including direct relationships"
+    ,"mirrored upward and downward bend ordering"
+    ,"Y-direction overshoot and return rejection"
+    ,"safe H-V-H preference over additional staircase bends"
   ],
   "notes": [
     "The full 553-task and 599-link regression input is not present in this workspace.",

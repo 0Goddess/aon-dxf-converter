@@ -1097,6 +1097,38 @@ class EzdxfAonWriter:
             for link_index, lane in assignment.items():
                 direct_level[link_index] = row_y - top_offset - (lane + 1) * usable_height / (count + 1)
 
+        # A direct horizontal relationship is part of the same source fan as
+        # upward and downward relationships.  When a source has both direct
+        # and routed successors, reserve the direct port at its true
+        # top-to-bottom target rank instead of forcing it into a centre lane.
+        # This prevents the routed ports from crowding or crossing around a
+        # separately chosen horizontal level.
+        all_source_endpoints: dict[tuple[int, str], list[Link]] = collections.defaultdict(list)
+        for link in self.layout.links:
+            source_side, _ = self.endpoint_sides(link)
+            all_source_endpoints[(link.pred_uid, source_side)].append(link)
+        for (uid, _), links in all_source_endpoints.items():
+            if not any(link.index in direct_level for link in links):
+                continue
+            if not any(link.index not in direct_level for link in links):
+                continue
+            ordered = sorted(
+                links,
+                key=lambda link: (
+                    -self.layout.nodes[link.succ_uid].y,
+                    self.layout.nodes[link.succ_uid].task.task_id,
+                    link.index,
+                ),
+            )
+            node_top = self.layout.nodes[uid].y
+            levels = [
+                node_top - 4.0 - (index + 1) * (NODE_HEIGHT - 8.0) / (len(ordered) + 1)
+                for index in range(len(ordered))
+            ]
+            for link, level in zip(ordered, levels):
+                if link.index in direct_level:
+                    direct_level[link.index] = level
+
         direct_geometry: dict[int, dict[str, object]] = {}
         accepted_direct_segments: list[tuple[tuple[float, float], tuple[float, float]]] = []
         for link in self.layout.links:
@@ -1216,9 +1248,10 @@ class EzdxfAonWriter:
                 port_slot[(link_index, role)] = slot
                 port_count[(link_index, role)] = count
 
-        # Plan source fan-outs as groups.  Target order controls both the port
-        # elevation and a monotone staircase of vertical bends: higher targets
-        # use higher ports and a bend farther from the source.  Nearby source
+        # Plan source fan-outs as one complete group per source side.  Upward,
+        # same-row and downward successors share one target order; higher
+        # targets use higher ports.  Bend distance is mirrored by direction:
+        # the highest upward and lowest downward targets turn nearest. Nearby source
         # nodes in the same time column receive non-overlapping X corridor
         # bands so their fan-outs cannot interleave.
         source_groups: dict[tuple[int, str], list[Link]] = collections.defaultdict(list)
@@ -1228,54 +1261,41 @@ class EzdxfAonWriter:
 
         fan_turn_rank: dict[int, int] = {}
         fan_direction: dict[int, int] = {}
-        directional_source_groups: dict[tuple[int, str, int], list[Link]] = collections.defaultdict(list)
         for (uid, side), group_links in source_groups.items():
             source_y = self.layout.nodes[uid].y
             for link in group_links:
                 target_y = self.layout.nodes[link.succ_uid].y
                 direction = (target_y > source_y) - (target_y < source_y)
                 fan_direction[link.index] = direction
-                directional_source_groups[(uid, side, direction)].append(link)
-
-        for (_, _, direction), group_links in directional_source_groups.items():
-            if direction > 0:
-                # Upward fan: highest target turns nearest the source.
+            by_direction: dict[int, list[Link]] = collections.defaultdict(list)
+            for link in group_links:
+                by_direction[fan_direction[link.index]].append(link)
+            for direction, directional_links in by_direction.items():
                 ordered_links = sorted(
-                    group_links,
+                    directional_links,
                     key=lambda item: (
-                        -self.layout.nodes[item.succ_uid].y,
+                        -self.layout.nodes[item.succ_uid].y
+                        if direction > 0
+                        else self.layout.nodes[item.succ_uid].y,
                         self.layout.nodes[item.succ_uid].task.task_id,
                         item.index,
                     ),
                 )
-            elif direction < 0:
-                # Downward fan is the vertical mirror: lowest target turns
-                # nearest the source, then higher targets step outward.
-                ordered_links = sorted(
-                    group_links,
-                    key=lambda item: (
-                        self.layout.nodes[item.succ_uid].y,
-                        self.layout.nodes[item.succ_uid].task.task_id,
-                        item.index,
-                    ),
-                )
-            else:
-                ordered_links = sorted(group_links, key=lambda item: item.index)
-            for position, link in enumerate(ordered_links):
-                fan_turn_rank[link.index] = position
+                for position, link in enumerate(ordered_links):
+                    fan_turn_rank[link.index] = position
 
-        source_band_base: dict[tuple[int, str, int], float] = collections.defaultdict(float)
+        source_band_base: dict[tuple[int, str], float] = collections.defaultdict(float)
         # Build regional competition groups from overlapping horizontal fan
         # spans, not only identical source X coordinates.  Two nearby sources
         # whose candidate corridors cover the same X range must coordinate
         # their vertical bands even when their nodes occupy adjacent columns.
         fan_records: list[
-            tuple[tuple[int, str, int], str, int, float, float, float]
+            tuple[tuple[int, str], str, float, float, float]
         ] = []
-        for key, group_links in directional_source_groups.items():
+        for key, group_links in source_groups.items():
             if len(group_links) < 2:
                 continue
-            uid, side, direction = key
+            uid, side = key
             node = self.layout.nodes[uid]
             source_x = node.x + NODE_WIDTH if side == "R" else node.x
             target_xs = []
@@ -1287,22 +1307,22 @@ class EzdxfAonWriter:
                 )
             low = min([source_x] + target_xs) - MIN_ENDPOINT_STUB_LENGTH
             high = max([source_x] + target_xs) + MIN_ENDPOINT_STUB_LENGTH
-            fan_records.append((key, side, direction, low, high, node.y))
+            fan_records.append((key, side, low, high, node.y))
 
         regional_clusters: list[
-            list[tuple[tuple[int, str, int], str, int, float, float, float]]
+            list[tuple[tuple[int, str], str, float, float, float]]
         ] = []
-        for record in sorted(fan_records, key=lambda item: (item[1], item[2], item[3], -item[5])):
-            _, side, direction, low, high, source_y = record
+        for record in sorted(fan_records, key=lambda item: (item[1], item[2], -item[4])):
+            _, side, low, high, source_y = record
             matching_cluster = None
             for cluster in regional_clusters:
                 first = cluster[0]
-                if first[1] != side or first[2] != direction:
+                if first[1] != side:
                     continue
-                cluster_low = min(item[3] for item in cluster)
-                cluster_high = max(item[4] for item in cluster)
+                cluster_low = min(item[2] for item in cluster)
+                cluster_high = max(item[3] for item in cluster)
                 vertically_near = any(
-                    abs(source_y - item[5]) <= 4.0 * Y_SPACING
+                    abs(source_y - item[4]) <= 4.0 * Y_SPACING
                     for item in cluster
                 )
                 if vertically_near and min(high, cluster_high) >= max(low, cluster_low):
@@ -1314,20 +1334,18 @@ class EzdxfAonWriter:
                 matching_cluster.append(record)
 
         for cluster in regional_clusters:
-            direction = cluster[0][2]
             cursor = 0.0
-            reverse = direction >= 0
-            for key, _, _, _, _, _ in sorted(
+            for key, _, _, _, _ in sorted(
                 cluster,
                 key=lambda item: (
-                    item[5],
+                    item[4],
                     self.layout.nodes[item[0][0]].task.task_id,
                 ),
-                reverse=reverse,
+                reverse=True,
             ):
                 source_band_base[key] = cursor
                 cursor += (
-                    max(1, len(directional_source_groups[key]))
+                    max(1, len(source_groups[key]))
                     * ENDPOINT_CHANNEL_STEP
                     + PREFERRED_VERTICAL_CHANNEL_SPACING
                 )
@@ -1355,7 +1373,6 @@ class EzdxfAonWriter:
                     (
                         link.pred_uid,
                         source_side,
-                        fan_direction.get(link.index, 0),
                     )
                 ]
                 + fan_turn_rank.get(link.index, 0) * source_spacing
@@ -1674,6 +1691,23 @@ class EzdxfAonWriter:
                 and ((second[0] > first[0]) - (second[0] < first[0])) != overall
             )
 
+        def path_y_reversals(points: list[tuple[float, float]]) -> int:
+            """Count vertical travel away from the target or beyond it."""
+            if len(points) < 2:
+                return 0
+            overall = (points[-1][1] > points[0][1]) - (
+                points[-1][1] < points[0][1]
+            )
+            vertical_directions = [
+                (second[1] > first[1]) - (second[1] < first[1])
+                for first, second in orthogonal_segments(points)
+                if math.isclose(first[0], second[0], abs_tol=1e-6)
+                and not math.isclose(first[1], second[1], abs_tol=1e-6)
+            ]
+            if overall == 0:
+                return len(vertical_directions)
+            return sum(direction != overall for direction in vertical_directions)
+
         def first_vertical_x(
             points: list[tuple[float, float]],
         ) -> float | None:
@@ -1684,12 +1718,7 @@ class EzdxfAonWriter:
 
         def source_fan_is_locked(link: Link) -> bool:
             source_side, _ = self.endpoint_sides(link)
-            key = (
-                link.pred_uid,
-                source_side,
-                fan_direction.get(link.index, 0),
-            )
-            return len(directional_source_groups.get(key, [])) >= 2
+            return len(source_groups.get((link.pred_uid, source_side), [])) >= 2
 
         def preserves_locked_source_bend(
             link: Link,
@@ -1742,7 +1771,7 @@ class EzdxfAonWriter:
                 round(self.layout.nodes[item.pred_uid].x, 6),
                 -self.layout.nodes[item.pred_uid].y,
                 self.layout.nodes[item.pred_uid].task.task_id,
-                -fan_turn_rank.get(item.index, 0),
+                fan_turn_rank.get(item.index, 0),
                 item.index,
             ),
         )
@@ -1752,14 +1781,12 @@ class EzdxfAonWriter:
             arrow_base = (float(geometry["base"][0]), float(geometry["base"][1]))
             source_shift = 1 if geometry["source_side"] == "R" else -1
             target_shift = -int(geometry["arrow_direction"])
-            direction_key = fan_direction.get(link.index, 0)
             fan_key = (
                 link.pred_uid,
                 str(geometry["source_side"]),
-                direction_key,
             )
             locked_source_fan = len(
-                directional_source_groups.get(fan_key, [])
+                source_groups.get(fan_key, [])
             ) >= 2
             row_span = abs(
                 self.layout.nodes[link.pred_uid].task.row
@@ -1772,7 +1799,7 @@ class EzdxfAonWriter:
             selected_points: list[tuple[float, float]] | None = None
             route_mode = ""
             crossing_fallback: tuple[
-                tuple[int, int, float], list[tuple[float, float]], str
+                tuple[int, int, int, float], list[tuple[float, float]], str
             ] | None = None
 
             # Enumerate both source- and target-side trunks before selecting a
@@ -1792,6 +1819,7 @@ class EzdxfAonWriter:
                     dogleg_candidates.append(
                         (
                             (
+                                path_y_reversals(candidate),
                                 path_crossing_count(candidate),
                                 path_x_reversals(candidate),
                                 path_length(candidate),
@@ -1818,6 +1846,7 @@ class EzdxfAonWriter:
                     dogleg_candidates.append(
                         (
                             (
+                                path_y_reversals(candidate),
                                 path_crossing_count(candidate),
                                 path_x_reversals(candidate),
                                 path_length(candidate),
@@ -1830,7 +1859,7 @@ class EzdxfAonWriter:
                     )
             if dogleg_candidates:
                 score, candidate_points, candidate_mode = min(dogleg_candidates, key=lambda item: item[0])
-                if score[0] == 0 and score[1] == 0:
+                if score[0] == 0 and score[1] == 0 and score[2] == 0:
                     selected_points = candidate_points
                     route_mode = candidate_mode
                     if route_mode == "source_dogleg":
@@ -1839,7 +1868,7 @@ class EzdxfAonWriter:
                         target_dogleg_links += 1
                 else:
                     crossing_fallback = (
-                        (score[0], score[1], score[2]),
+                        (score[0], score[1], score[2], score[3]),
                         candidate_points,
                         candidate_mode,
                     )
@@ -1871,6 +1900,7 @@ class EzdxfAonWriter:
                             detour_candidates.append(
                                 (
                                     (
+                                        path_y_reversals(candidate),
                                         path_crossing_count(candidate),
                                         path_x_reversals(candidate),
                                         path_length(candidate),
@@ -1883,11 +1913,11 @@ class EzdxfAonWriter:
                             )
                 if detour_candidates:
                     score, candidate_points = min(detour_candidates, key=lambda item: item[0])
-                    if score[0] == 0 and score[1] == 0:
+                    if score[0] == 0 and score[1] == 0 and score[2] == 0:
                         selected_points = candidate_points
                     else:
                         fallback = (
-                            (score[0], score[1], score[2]),
+                            (score[0], score[1], score[2], score[3]),
                             candidate_points,
                             "detour",
                         )
@@ -1959,6 +1989,7 @@ class EzdxfAonWriter:
                                 local_candidates.append(
                                     (
                                         (
+                                            path_y_reversals(candidate),
                                             path_crossing_count(candidate),
                                             path_x_reversals(candidate),
                                             path_length(candidate),
@@ -1972,11 +2003,11 @@ class EzdxfAonWriter:
                         score, candidate_points = min(
                             local_candidates, key=lambda item: item[0]
                         )
-                        if score[0] == 0 and score[1] == 0:
+                        if score[0] == 0 and score[1] == 0 and score[2] == 0:
                             selected_points = candidate_points
                         else:
                             fallback = (
-                                (score[0], score[1], score[2]),
+                                (score[0], score[1], score[2], score[3]),
                                 candidate_points,
                                 "detour",
                             )
@@ -2004,14 +2035,15 @@ class EzdxfAonWriter:
                                 ]
                             )
                             if path_is_clear(link, candidate):
+                                y_reversals = path_y_reversals(candidate)
                                 crossings = path_crossing_count(candidate)
                                 reversals = path_x_reversals(candidate)
-                                if crossings == 0 and reversals == 0:
+                                if y_reversals == 0 and crossings == 0 and reversals == 0:
                                     selected_points = candidate
                                     relaxed_detour_links += 1
                                     break
                                 fallback = (
-                                    (crossings, reversals, path_length(candidate)),
+                                    (y_reversals, crossings, reversals, path_length(candidate)),
                                     candidate,
                                     "detour",
                                 )
@@ -2065,14 +2097,15 @@ class EzdxfAonWriter:
                                 [start, (source_x, start[1]), (source_x, outside_y), (target_x, outside_y), (target_x, arrow_base[1]), arrow_base]
                             )
                             if path_is_clear(link, candidate):
+                                y_reversals = path_y_reversals(candidate)
                                 crossings = path_crossing_count(candidate)
                                 reversals = path_x_reversals(candidate)
-                                if crossings == 0 and reversals == 0:
+                                if y_reversals == 0 and crossings == 0 and reversals == 0:
                                     selected_points = candidate
                                     emergency_detour_links += 1
                                     break
                                 fallback = (
-                                    (crossings, reversals, path_length(candidate)),
+                                    (y_reversals, crossings, reversals, path_length(candidate)),
                                     candidate,
                                     "detour",
                                 )
@@ -2218,12 +2251,19 @@ class EzdxfAonWriter:
             return proper_crossing_point(first, second) is not None
 
         def crosses_same_source(link: Link, points: list[tuple[float, float]]) -> bool:
-            # Port ordering already separates the source fan-out.  Do not turn
-            # a remaining clean X crossing into a hard routing failure: dense
-            # networks can have no alternative once node and no-touch rules
-            # are applied.  Crossings remain a route-order preference rather
-            # than an absolute feasibility condition.
-            return False
+            # The source fan-out is one ordered staircase.  Its first two
+            # segments may never cross, touch, or exchange order with an
+            # already accepted branch from the same source.
+            candidate_segments = orthogonal_segments(points)[:2]
+            return any(
+                pred_uid == link.pred_uid
+                and (
+                    physically_touches(candidate, accepted)
+                    or properly_crosses(candidate, accepted)
+                )
+                for candidate in candidate_segments
+                for pred_uid, accepted in accepted_link_segments
+            )
 
         def touches_accepted(points: list[tuple[float, float]]) -> bool:
             segments = orthogonal_segments(points)
@@ -2298,6 +2338,7 @@ class EzdxfAonWriter:
             if (
                 (not bool(geometry.get("direct")) and not respects_endpoint_stubs(simplified))
                 or not preserves_locked_source_bend(link, simplified, original)
+                or path_y_reversals(simplified) > path_y_reversals(original)
             ):
                 simplified = original
             geometry["points"] = simplified
@@ -2320,6 +2361,7 @@ class EzdxfAonWriter:
                     float(geometry_by_link[index]["start"][1])
                     - float(geometry_by_link[index]["base"][1])
                 ),
+                fan_turn_rank.get(index, 0),
                 index,
             ),
         )
@@ -2359,7 +2401,7 @@ class EzdxfAonWriter:
                     candidate = simplify_points(
                         [start, (trunk_x, start[1]), (trunk_x, arrow_base[1]), arrow_base]
                     )
-                    if respects_endpoint_stubs(candidate) and not path_hits_node(link, candidate) and not overlaps_accepted(candidate) and not crosses_same_source(link, candidate) and keeps_source_fan(candidate):
+                    if respects_endpoint_stubs(candidate) and not path_hits_node(link, candidate) and not overlaps_accepted(candidate) and not crosses_same_source(link, candidate) and keeps_source_fan(candidate) and path_y_reversals(candidate) == 0:
                         chosen = candidate
                         break
 
@@ -2440,6 +2482,7 @@ class EzdxfAonWriter:
                                     and not overlaps_accepted(candidate)
                                     and not crosses_same_source(link, candidate)
                                     and keeps_source_fan(candidate)
+                                    and path_y_reversals(candidate) == 0
                                 ):
                                     chosen = candidate
                                     chosen_mode = "between_nodes"
@@ -2477,7 +2520,7 @@ class EzdxfAonWriter:
                             arrow_base,
                         ]
                     )
-                    if respects_endpoint_stubs(candidate) and not path_hits_node(link, candidate) and not overlaps_accepted(candidate) and not crosses_same_source(link, candidate) and keeps_source_fan(candidate):
+                    if respects_endpoint_stubs(candidate) and not path_hits_node(link, candidate) and not overlaps_accepted(candidate) and not crosses_same_source(link, candidate) and keeps_source_fan(candidate) and path_y_reversals(candidate) == 0:
                         chosen = candidate
                         break
 
@@ -2514,7 +2557,7 @@ class EzdxfAonWriter:
                             arrow_base,
                         ]
                     )
-                    if respects_endpoint_stubs(candidate) and not path_hits_node(link, candidate) and not overlaps_accepted(candidate) and not crosses_same_source(link, candidate) and keeps_source_fan(candidate):
+                    if respects_endpoint_stubs(candidate) and not path_hits_node(link, candidate) and not overlaps_accepted(candidate) and not crosses_same_source(link, candidate) and keeps_source_fan(candidate) and path_y_reversals(candidate) == 0:
                         chosen = candidate
                         break
                 if chosen is None:
@@ -2542,7 +2585,7 @@ class EzdxfAonWriter:
                                 arrow_base,
                             ]
                         )
-                        if respects_endpoint_stubs(candidate) and not path_hits_node(link, candidate) and not touches_accepted(candidate) and not crosses_same_source(link, candidate) and keeps_source_fan(candidate):
+                        if respects_endpoint_stubs(candidate) and not path_hits_node(link, candidate) and not touches_accepted(candidate) and not crosses_same_source(link, candidate) and keeps_source_fan(candidate) and path_y_reversals(candidate) == 0:
                             chosen = candidate
                             break
                 if chosen is None:
@@ -2593,7 +2636,7 @@ class EzdxfAonWriter:
                                         arrow_base,
                                     ]
                                 )
-                                if respects_endpoint_stubs(candidate) and not path_hits_node(link, candidate) and not touches_accepted(candidate) and not crosses_same_source(link, candidate) and keeps_source_fan(candidate):
+                                if respects_endpoint_stubs(candidate) and not path_hits_node(link, candidate) and not touches_accepted(candidate) and not crosses_same_source(link, candidate) and keeps_source_fan(candidate) and path_y_reversals(candidate) == 0:
                                     chosen = candidate
                                     break
                             if chosen is not None:
@@ -2635,12 +2678,14 @@ class EzdxfAonWriter:
                                 and not path_hits_node(link, candidate)
                                 and not touches_accepted(candidate)
                                 and keeps_source_fan(candidate)
+                                and path_y_reversals(candidate) == 0
+                                and not crosses_same_source(link, candidate)
                             ):
                                 chosen = candidate
                                 chosen_mode = "locked_fan_relaxed_order"
                                 locked_fan_relaxation_links += 1
                                 break
-                if chosen is None:
+                if chosen is None and not source_fan_is_locked(link):
                     # Absolute safety fallback for pathological congestion:
                     # search independent source/target trunks.  This may
                     # relax the fan bend order, but never the geometric hard
@@ -2676,7 +2721,7 @@ class EzdxfAonWriter:
                             break
                 if chosen is not None:
                     shortened = remove_unnecessary_detours(link, chosen)
-                    if respects_endpoint_stubs(shortened) and not path_hits_node(link, shortened) and not overlaps_accepted(shortened) and keeps_source_fan(shortened):
+                    if respects_endpoint_stubs(shortened) and not path_hits_node(link, shortened) and not overlaps_accepted(shortened) and keeps_source_fan(shortened) and path_y_reversals(shortened) <= path_y_reversals(chosen):
                         chosen = shortened
                     points = chosen
                     geometry["points"] = points
@@ -2783,6 +2828,7 @@ class EzdxfAonWriter:
                     or path_hits_node(link, candidate)
                     or path_self_intersects(candidate)
                     or path_x_reversals(candidate) > path_x_reversals(current)
+                    or path_y_reversals(candidate) > path_y_reversals(current)
                     or not preserves_locked_source_bend(link, candidate, current)
                 ):
                     continue
@@ -2920,6 +2966,7 @@ class EzdxfAonWriter:
                         or path_hits_node(link, candidate)
                         or path_self_intersects(candidate)
                         or path_x_reversals(candidate) > path_x_reversals(current)
+                        or path_y_reversals(candidate) > path_y_reversals(current)
                         or not preserves_locked_source_bend(link, candidate, current)
                     ):
                         continue
@@ -3110,6 +3157,8 @@ class EzdxfAonWriter:
                         or path_self_intersects(points)
                         or path_x_reversals(points)
                         > path_x_reversals(original_points)
+                        or path_y_reversals(points)
+                        > path_y_reversals(original_points)
                     ):
                         valid = False
                         break
