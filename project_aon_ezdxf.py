@@ -2999,6 +2999,92 @@ class EzdxfAonWriter:
                                 chosen_mode = "locked_fan_relaxed_order"
                                 locked_fan_relaxation_links += 1
                                 break
+                if chosen is None and source_fan_is_locked(link):
+                    # A locked multi-successor fan must retain its assigned
+                    # first vertical bend, but it may still use any clear
+                    # monotonic corridor between source and target.  The
+                    # earlier compact search samples only a few preferred
+                    # levels and target offsets; a dense drawing can occupy
+                    # every sampled lane even though another legal lane
+                    # exists.  Exhaust the remaining inter-node band before
+                    # considering an outer-frame route or failing the export.
+                    locked_x = first_vertical_x(points)
+                    vertical_gap = arrow_base[1] - start[1]
+                    if locked_x is not None and not math.isclose(
+                        vertical_gap, 0.0, abs_tol=1e-6
+                    ):
+                        direction = 1 if vertical_gap > 0.0 else -1
+                        gap_size = abs(vertical_gap)
+                        max_corridor_steps = min(
+                            120,
+                            max(
+                                1,
+                                int(
+                                    (
+                                        gap_size
+                                        - 2.0
+                                        * MIN_HORIZONTAL_CHANNEL_SPACING
+                                    )
+                                    // MIN_HORIZONTAL_CHANNEL_SPACING
+                                )
+                                + 1,
+                            ),
+                        )
+                        corridor_offsets = [
+                            MIN_HORIZONTAL_CHANNEL_SPACING
+                            + step * MIN_HORIZONTAL_CHANNEL_SPACING
+                            for step in range(max_corridor_steps)
+                            if (
+                                MIN_HORIZONTAL_CHANNEL_SPACING
+                                + step * MIN_HORIZONTAL_CHANNEL_SPACING
+                                <= gap_size
+                                - MIN_HORIZONTAL_CHANNEL_SPACING
+                            )
+                        ]
+                        corridor_offsets.sort(
+                            key=lambda offset: (
+                                abs(offset - gap_size / 2.0),
+                                offset,
+                            )
+                        )
+                        target_x_candidates = [
+                            arrow_base[0]
+                            + target_shift
+                            * (
+                                MIN_ENDPOINT_STUB_LENGTH
+                                + step * MIN_VERTICAL_CHANNEL_SPACING
+                            )
+                            for step in range(81)
+                        ]
+                        for offset in corridor_offsets:
+                            corridor_y = start[1] + direction * offset
+                            for target_x in target_x_candidates:
+                                candidate = simplify_points(
+                                    [
+                                        start,
+                                        (locked_x, start[1]),
+                                        (locked_x, corridor_y),
+                                        (target_x, corridor_y),
+                                        (target_x, arrow_base[1]),
+                                        arrow_base,
+                                    ]
+                                )
+                                if (
+                                    respects_endpoint_stubs(candidate)
+                                    and not path_hits_node(link, candidate)
+                                    and not touches_accepted(candidate)
+                                    and not crosses_same_source(link, candidate)
+                                    and keeps_source_fan(candidate)
+                                    and path_y_reversals(candidate) == 0
+                                ):
+                                    chosen = candidate
+                                    chosen_mode = (
+                                        "locked_fan_exhaustive_corridor"
+                                    )
+                                    locked_fan_relaxation_links += 1
+                                    break
+                            if chosen is not None:
+                                break
                 if chosen is None and not source_fan_is_locked(link):
                     # Absolute safety fallback for pathological congestion:
                     # search independent source/target trunks.  This may

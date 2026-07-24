@@ -1,5 +1,5 @@
 {
-  "application_version": "2.0.0",
+  "application_version": "2.0.1",
   "source_mode_test": "passed",
   "windows_packaged_runtime_test": "pending GitHub Actions Windows build",
   "large_project_regression_test": "original schedule parsed: 553 tasks / 599 links; full DXF conversion intentionally not run",

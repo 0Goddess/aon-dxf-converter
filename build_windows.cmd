@@ -38,6 +38,7 @@ if exist "dist\AON_XML_to_DXF" rmdir /s /q "dist\AON_XML_to_DXF"
 call ".venv_build\Scripts\python.exe" -m PyInstaller --noconfirm AON_XML_to_DXF.spec
 if errorlevel 1 goto :error
 copy /y "README_使用說明.txt" "dist\AON_XML_to_DXF\README_使用說明.txt" >nul
+copy /y "工作框與箭線規則_V2.txt" "dist\AON_XML_to_DXF\工作框與箭線規則_V2.txt" >nul
 copy /y "THIRD_PARTY_NOTICES.txt" "dist\AON_XML_to_DXF\THIRD_PARTY_NOTICES.txt" >nul
 
 echo [5/5] 建立 ZIP...
@@ -55,4 +56,3 @@ echo.
 echo 封裝失敗，請保留本視窗內容以便檢查。
 pause
 exit /b 1
-
