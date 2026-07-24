@@ -923,22 +923,65 @@ def enlarge_layout(
             collections.defaultdict(collections.Counter)
         )
         parent_chains: dict[int, set[int | None]] = collections.defaultdict(set)
+        chain_connections: dict[
+            int, list[tuple[int | None, int, int]]
+        ] = collections.defaultdict(list)
+        parent_connections: dict[
+            int, list[tuple[int | None, int, int]]
+        ] = collections.defaultdict(list)
         for link in layout.links:
             pred_chain = chain_of.get(link.pred_uid)
             succ_chain = chain_of.get(link.succ_uid)
             if pred_chain == succ_chain:
                 continue
+            pred_rank = period_index[task_period[link.pred_uid]]
+            succ_rank = period_index[task_period[link.succ_uid]]
+            low_rank, high_rank = sorted((pred_rank, succ_rank))
             if pred_chain is not None:
                 other = succ_chain if link.succ_uid not in critical_uids else None
                 chain_neighbors[pred_chain][other] += 1
+                chain_connections[pred_chain].append(
+                    (other, low_rank, high_rank)
+                )
             if succ_chain is not None:
                 other = pred_chain if link.pred_uid not in critical_uids else None
                 chain_neighbors[succ_chain][other] += 1
                 parent_chains[succ_chain].add(other)
+                chain_connections[succ_chain].append(
+                    (other, low_rank, high_rank)
+                )
+                parent_connections[succ_chain].append(
+                    (other, low_rank, high_rank)
+                )
+
+        chain_depth_cache: dict[int, int] = {}
+
+        def chain_depth(chain_index: int, visiting: set[int] | None = None) -> int:
+            cached = chain_depth_cache.get(chain_index)
+            if cached is not None:
+                return cached
+            visiting = set() if visiting is None else visiting
+            if chain_index in visiting:
+                return 0
+            visiting.add(chain_index)
+            parents = parent_chains.get(chain_index, set())
+            noncritical_parents = [
+                parent for parent in parents if parent is not None
+            ]
+            if not parents or None in parents or not noncritical_parents:
+                result = 0
+            else:
+                result = 1 + min(
+                    chain_depth(parent, visiting) for parent in noncritical_parents
+                )
+            visiting.remove(chain_index)
+            chain_depth_cache[chain_index] = result
+            return result
 
         ordered_chain_indices = sorted(
             range(len(noncritical_chains)),
             key=lambda chain_index: (
+                chain_depth(chain_index),
                 -len(noncritical_chains[chain_index]),
                 chain_anchor_rank[chain_index],
                 layout.nodes[noncritical_chains[chain_index][0]].task.task_id,
@@ -964,14 +1007,108 @@ def enlarge_layout(
                 ).items()
                 if neighbor is None or neighbor in assigned_chain_row
             ]
+            placed_parent_rows = [
+                0 if parent is None else assigned_chain_row[parent]
+                for parent in parent_chains.get(chain_index, set())
+                if parent is None or parent in assigned_chain_row
+            ]
+            nonzero_parent_signs = {
+                1 if row > 0 else -1 for row in placed_parent_rows if row != 0
+            }
+
+            def respects_hierarchy(row: int) -> bool:
+                # A child branch of a non-critical trunk stays on that trunk's
+                # side of the critical path.  Its connecting corridor may not
+                # pass through the occupied time span of another trunk/branch.
+                sign = 1 if row > 0 else -1
+                if len(nonzero_parent_signs) == 1 and sign not in nonzero_parent_signs:
+                    return False
+                for neighbor, low_rank, high_rank in parent_connections.get(
+                    chain_index, []
+                ):
+                    if neighbor is not None and neighbor not in assigned_chain_row:
+                        continue
+                    neighbor_row = (
+                        0 if neighbor is None else assigned_chain_row[neighbor]
+                    )
+                    for crossed_row in range(
+                        min(row, neighbor_row) + 1,
+                        max(row, neighbor_row),
+                    ):
+                        if not set(range(low_rank, high_rank + 1)).isdisjoint(
+                            occupied_ranks_by_row[crossed_row]
+                        ):
+                            return False
+                return True
+
             candidates = [
                 row
                 for magnitude in range(1, max_candidate_row + 1)
                 for row in (magnitude, -magnitude)
                 if span.isdisjoint(occupied_ranks_by_row[row])
+                and respects_hierarchy(row)
             ]
             if not candidates:
-                candidates = [max_candidate_row + 1, -(max_candidate_row + 1)]
+                candidates = [
+                    row
+                    for magnitude in range(
+                        max_candidate_row + 1, max_candidate_row * 2 + 3
+                    )
+                    for row in (magnitude, -magnitude)
+                    if span.isdisjoint(occupied_ranks_by_row[row])
+                    and respects_hierarchy(row)
+                ]
+            if not candidates:
+                # Multiple-parent structures can make every strict-side
+                # candidate impossible.  Keep collision and corridor crossing
+                # checks hard, but allow either side before adding a new row.
+                nonzero_parent_signs.clear()
+                candidates = [
+                    row
+                    for magnitude in range(1, max_candidate_row * 2 + 3)
+                    for row in (magnitude, -magnitude)
+                    if span.isdisjoint(occupied_ranks_by_row[row])
+                    and respects_hierarchy(row)
+                ]
+            if not candidates:
+                # Insert a real shared row next to the parent trunk.  Existing
+                # trunks on that side move outward as complete chains, leaving
+                # their internal layout intact and opening a collision-free
+                # branch row without reserving a permanent private band.
+                if placed_parent_rows:
+                    parent_row = min(
+                        placed_parent_rows,
+                        key=lambda row: (abs(row), row),
+                    )
+                    if parent_row > 0:
+                        inserted_row = parent_row + 1
+                    elif parent_row < 0:
+                        inserted_row = parent_row - 1
+                    else:
+                        inserted_row = 1 if side_load[1] <= side_load[-1] else -1
+                else:
+                    inserted_row = 1 if side_load[1] <= side_load[-1] else -1
+
+                shifted_rows: dict[int, set[int]] = collections.defaultdict(set)
+                for other_chain, other_row in list(assigned_chain_row.items()):
+                    shift = (
+                        inserted_row > 0 and other_row >= inserted_row
+                    ) or (
+                        inserted_row < 0 and other_row <= inserted_row
+                    )
+                    new_row = (
+                        other_row + (1 if inserted_row > 0 else -1)
+                        if shift
+                        else other_row
+                    )
+                    assigned_chain_row[other_chain] = new_row
+                    shifted_rows[new_row].update(chain_spans[other_chain])
+                    if shift:
+                        for uid in noncritical_chains[other_chain]:
+                            layout.nodes[uid].task.row = new_row
+                            layout.nodes[uid].y = new_row * Y_SPACING
+                occupied_ranks_by_row = shifted_rows
+                candidates = [inserted_row]
 
             def hierarchy_cost(row: int) -> tuple[float, int, int]:
                 sign = 1 if row > 0 else -1

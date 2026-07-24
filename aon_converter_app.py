@@ -24,7 +24,7 @@ from project_aon_ezdxf import EzdxfAonWriter, NODE_HEIGHT, X_SPACING, Y_SPACING,
 
 
 APP_NAME = "Project XML 轉 AON DXF"
-APP_VERSION = "1.8.0-TEST4"
+APP_VERSION = "1.8.0-TEST5"
 OUTPUT_SUFFIX = "_AON全區_AutoCAD2023.dxf"
 
 
