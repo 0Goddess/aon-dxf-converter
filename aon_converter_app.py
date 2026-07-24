@@ -20,11 +20,19 @@ import ezdxf
 
 from outline_dxf_unicode_text import convert as outline_unicode_text
 from project_aon_converter import build_layout, parse_project
-from project_aon_ezdxf import EzdxfAonWriter, NODE_HEIGHT, X_SPACING, Y_SPACING, enlarge_layout
+from project_aon_ezdxf import (
+    EzdxfAonWriter,
+    NODE_HEIGHT,
+    NODE_ROUTE_CLEARANCE,
+    NODE_WIDTH,
+    X_SPACING,
+    Y_SPACING,
+    enlarge_layout,
+)
 
 
 APP_NAME = "Project XML 轉 AON DXF"
-APP_VERSION = "2.0.1"
+APP_VERSION = "2.0.2"
 OUTPUT_SUFFIX = "_AON全區_AutoCAD2023.dxf"
 
 
@@ -101,18 +109,56 @@ def insert_route_row_gap(layout, link_index: int, gap: float = Y_SPACING) -> boo
         return False
     pred = layout.nodes[link.pred_uid]
     succ = layout.nodes[link.succ_uid]
-    if abs(succ.y - pred.y) < 1e-6:
-        return False
+    same_row = abs(succ.y - pred.y) < 1e-6
+    if same_row:
+        # A same-row relationship can still need a vertical detour corridor.
+        # Compare the immediately adjacent bands across the relationship span
+        # and open the less occupied side instead of refusing row expansion.
+        span_left = min(pred.x, succ.x)
+        span_right = max(
+            pred.x + NODE_WIDTH,
+            succ.x + NODE_WIDTH,
+        )
 
-    upward = succ.y > pred.y
-    threshold = succ.y
+        def overlaps_link_span(node) -> bool:
+            return (
+                node.x < span_right + NODE_ROUTE_CLEARANCE
+                and node.x + NODE_WIDTH > span_left - NODE_ROUTE_CLEARANCE
+            )
+
+        above_load = sum(
+            overlaps_link_span(node)
+            and pred.y < node.y <= pred.y + Y_SPACING + 1e-6
+            for uid, node in layout.nodes.items()
+            if uid not in {link.pred_uid, link.succ_uid}
+        )
+        below_load = sum(
+            overlaps_link_span(node)
+            and pred.y - Y_SPACING - 1e-6 <= node.y < pred.y
+            for uid, node in layout.nodes.items()
+            if uid not in {link.pred_uid, link.succ_uid}
+        )
+        upward = above_load <= below_load
+        threshold = pred.y
+    else:
+        upward = succ.y > pred.y
+        threshold = succ.y
+
     moved = False
     for node in layout.nodes.values():
-        if upward and node.y >= threshold - 1e-6:
+        if upward and (
+            node.y > threshold + 1e-6
+            if same_row
+            else node.y >= threshold - 1e-6
+        ):
             node.y += gap
             node.task.row += 1
             moved = True
-        elif not upward and node.y <= threshold + 1e-6:
+        elif not upward and (
+            node.y < threshold - 1e-6
+            if same_row
+            else node.y <= threshold + 1e-6
+        ):
             node.y -= gap
             node.task.row -= 1
             moved = True
@@ -208,9 +254,13 @@ def convert_project(
                     blocked_link, {"horizontal": 0, "vertical": 0}
                 )
                 expanded = False
-                # Test both dimensions instead of assuming every blockage is
-                # horizontal: H1 -> V1 -> H2 -> V2.
-                if attempts["horizontal"] == attempts["vertical"] and attempts["horizontal"] < 2:
+                # Expand each dimension once before using its second gap:
+                # H1 -> V1 -> H2 -> V2.  Same-row relationships are allowed
+                # to open a blank row above or below their shared row.
+                if (
+                    attempts["horizontal"] == attempts["vertical"]
+                    and attempts["horizontal"] < 2
+                ):
                     expanded = insert_route_column_gap(layout, blocked_link)
                     if expanded:
                         attempts["horizontal"] += 1
@@ -218,7 +268,11 @@ def convert_project(
                             43,
                             f"關係 {blocked_link} 水平空間不足，插入第 {attempts['horizontal']} 格空白欄後重新排線…",
                         )
-                if not expanded and attempts["vertical"] < 2:
+                    else:
+                        attempts["horizontal"] = 2
+                if expanded:
+                    continue
+                if attempts["vertical"] < 2:
                     expanded = insert_route_row_gap(layout, blocked_link)
                     if expanded:
                         attempts["vertical"] += 1
@@ -226,7 +280,11 @@ def convert_project(
                             43,
                             f"關係 {blocked_link} 垂直通道不足，插入第 {attempts['vertical']} 格空白列後重新排線…",
                         )
-                if not expanded and attempts["horizontal"] < 2:
+                    else:
+                        attempts["vertical"] = 2
+                if expanded:
+                    continue
+                if attempts["horizontal"] < 2:
                     expanded = insert_route_column_gap(layout, blocked_link)
                     if expanded:
                         attempts["horizontal"] += 1
@@ -234,6 +292,8 @@ def convert_project(
                             43,
                             f"關係 {blocked_link} 水平空間仍不足，插入第 {attempts['horizontal']} 格空白欄後重新排線…",
                         )
+                    else:
+                        attempts["horizontal"] = 2
                 if expanded:
                     continue
 

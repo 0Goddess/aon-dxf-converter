@@ -3003,11 +3003,9 @@ class EzdxfAonWriter:
                     # A locked multi-successor fan must retain its assigned
                     # first vertical bend, but it may still use any clear
                     # monotonic corridor between source and target.  The
-                    # earlier compact search samples only a few preferred
-                    # levels and target offsets; a dense drawing can occupy
-                    # every sampled lane even though another legal lane
-                    # exists.  Exhaust the remaining inter-node band before
-                    # considering an outer-frame route or failing the export.
+                    # compact search above samples only preferred levels; a
+                    # dense drawing can occupy every sample even though
+                    # another legal lane exists.
                     locked_x = first_vertical_x(points)
                     vertical_gap = arrow_base[1] - start[1]
                     if locked_x is not None and not math.isclose(
