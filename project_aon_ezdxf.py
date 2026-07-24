@@ -893,6 +893,128 @@ def enlarge_layout(
             changed = True
         if not changed:
             break
+
+    hierarchical_chain_rows = 0
+    hierarchical_chain_moves = 0
+    if downstream_priority:
+        # TEST4 layout stage: keep the Project critical path on row 0, then
+        # place complete non-critical main/branch chains as horizontal units.
+        # Long chains are placed first and closest to their connected trunk.
+        # Shorter branches reuse a row only when their complete time spans do
+        # not overlap; otherwise a new upper/lower row is inserted.
+        noncritical_chains = [
+            [uid for uid in chain if uid not in critical_uids]
+            for chain in chains
+        ]
+        noncritical_chains = [chain for chain in noncritical_chains if chain]
+        chain_of = {
+            uid: chain_index
+            for chain_index, chain in enumerate(noncritical_chains)
+            for uid in chain
+        }
+        chain_spans: dict[int, set[int]] = {}
+        chain_anchor_rank: dict[int, float] = {}
+        for chain_index, chain in enumerate(noncritical_chains):
+            ranks = sorted(period_index[task_period[uid]] for uid in chain)
+            chain_spans[chain_index] = set(range(ranks[0], ranks[-1] + 1))
+            chain_anchor_rank[chain_index] = sum(ranks) / len(ranks)
+
+        chain_neighbors: dict[int, collections.Counter[int | None]] = (
+            collections.defaultdict(collections.Counter)
+        )
+        parent_chains: dict[int, set[int | None]] = collections.defaultdict(set)
+        for link in layout.links:
+            pred_chain = chain_of.get(link.pred_uid)
+            succ_chain = chain_of.get(link.succ_uid)
+            if pred_chain == succ_chain:
+                continue
+            if pred_chain is not None:
+                other = succ_chain if link.succ_uid not in critical_uids else None
+                chain_neighbors[pred_chain][other] += 1
+            if succ_chain is not None:
+                other = pred_chain if link.pred_uid not in critical_uids else None
+                chain_neighbors[succ_chain][other] += 1
+                parent_chains[succ_chain].add(other)
+
+        ordered_chain_indices = sorted(
+            range(len(noncritical_chains)),
+            key=lambda chain_index: (
+                -len(noncritical_chains[chain_index]),
+                chain_anchor_rank[chain_index],
+                layout.nodes[noncritical_chains[chain_index][0]].task.task_id,
+            ),
+        )
+        assigned_chain_row: dict[int, int] = {}
+        occupied_ranks_by_row: dict[int, set[int]] = collections.defaultdict(set)
+        side_load = {-1: 0, 1: 0}
+        sibling_side_load: collections.Counter[tuple[int | None, int]] = (
+            collections.Counter()
+        )
+        max_candidate_row = max(8, len(noncritical_chains) + 2)
+        for chain_index in ordered_chain_indices:
+            span = chain_spans[chain_index]
+            placed_neighbors = [
+                (
+                    0 if neighbor is None else assigned_chain_row[neighbor],
+                    weight,
+                    neighbor,
+                )
+                for neighbor, weight in chain_neighbors.get(
+                    chain_index, collections.Counter()
+                ).items()
+                if neighbor is None or neighbor in assigned_chain_row
+            ]
+            candidates = [
+                row
+                for magnitude in range(1, max_candidate_row + 1)
+                for row in (magnitude, -magnitude)
+                if span.isdisjoint(occupied_ranks_by_row[row])
+            ]
+            if not candidates:
+                candidates = [max_candidate_row + 1, -(max_candidate_row + 1)]
+
+            def hierarchy_cost(row: int) -> tuple[float, int, int]:
+                sign = 1 if row > 0 else -1
+                connection_cost = sum(
+                    weight * abs(row - neighbor_row)
+                    for neighbor_row, weight, _ in placed_neighbors
+                )
+                # Branches sharing a parent are distributed above and below
+                # when the parent is the centered critical trunk.  Away from
+                # the critical row, distance naturally keeps children near
+                # their own horizontal branch trunk.
+                sibling_cost = sum(
+                    sibling_side_load[(parent, sign)]
+                    for parent in parent_chains.get(chain_index, set())
+                )
+                balance_cost = side_load[sign] / max(
+                    1, len(noncritical_chains[chain_index])
+                )
+                return (
+                    connection_cost * 40.0
+                    + sibling_cost * 18.0
+                    + balance_cost
+                    + abs(row) * 2.0,
+                    abs(row),
+                    row,
+                )
+
+            chosen_row = min(candidates, key=hierarchy_cost)
+            assigned_chain_row[chain_index] = chosen_row
+            occupied_ranks_by_row[chosen_row].update(span)
+            sign = 1 if chosen_row > 0 else -1
+            side_load[sign] += len(noncritical_chains[chain_index])
+            for parent in parent_chains.get(chain_index, set()):
+                sibling_side_load[(parent, sign)] += 1
+            for uid in noncritical_chains[chain_index]:
+                node = layout.nodes[uid]
+                hierarchical_chain_moves += node.task.row != chosen_row
+                node.task.row = chosen_row
+                node.y = chosen_row * Y_SPACING
+            hierarchical_chain_rows = max(
+                hierarchical_chain_rows, abs(chosen_row)
+            )
+
     review_after = review_metrics()
 
     layout.lane_ranges = {}
@@ -917,6 +1039,8 @@ def enlarge_layout(
         "whole_chains_aligned": whole_chains_aligned,
         "row_swap_passes": row_swap_passes,
         "row_swap_moves": row_swap_moves,
+        "hierarchical_chain_rows": hierarchical_chain_rows,
+        "hierarchical_chain_moves": hierarchical_chain_moves,
         "horizontal_fs_before_review": review_before[0],
         "horizontal_fs_after_review": review_after[0],
         "crossing_proxy_before_review": review_before[1],
