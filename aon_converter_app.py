@@ -24,7 +24,7 @@ from project_aon_ezdxf import EzdxfAonWriter, NODE_HEIGHT, X_SPACING, Y_SPACING,
 
 
 APP_NAME = "Project XML 轉 AON DXF"
-APP_VERSION = "2.0.3"
+APP_VERSION = "2.0.4"
 OUTPUT_SUFFIX = "_AON全區_AutoCAD2023.dxf"
 
 
@@ -101,18 +101,56 @@ def insert_route_row_gap(layout, link_index: int, gap: float = Y_SPACING) -> boo
         return False
     pred = layout.nodes[link.pred_uid]
     succ = layout.nodes[link.succ_uid]
-    if abs(succ.y - pred.y) < 1e-6:
-        return False
+    same_row = abs(succ.y - pred.y) < 1e-6
+    if same_row:
+        row_y = pred.y
+        span_left = min(pred.x, succ.x) - X_SPACING * 0.25
+        span_right = max(pred.x, succ.x) + X_SPACING * 0.25
 
-    upward = succ.y > pred.y
-    threshold = succ.y
+        def side_nodes(upward: bool):
+            return [
+                node
+                for node in layout.nodes.values()
+                if (node.y > row_y + 1e-6 if upward else node.y < row_y - 1e-6)
+            ]
+
+        def side_score(upward: bool) -> tuple[int, int, int]:
+            nodes = side_nodes(upward)
+            critical_moves = sum(bool(node.task.critical) for node in nodes)
+            corridor_occupancy = sum(
+                span_left <= node.x <= span_right for node in nodes
+            )
+            return critical_moves, corridor_occupancy, len(nodes)
+
+        upward_score = side_score(True)
+        downward_score = side_score(False)
+        upward = upward_score <= downward_score
+        movable_nodes = side_nodes(upward)
+        if not movable_nodes:
+            # An empty side already provides an open outer corridor. Moving
+            # the occupied side would not enlarge that corridor and could
+            # disturb a critical row, so report no effective vertical change.
+            return False
+        threshold = row_y
+    else:
+        upward = succ.y > pred.y
+        threshold = succ.y
+
     moved = False
     for node in layout.nodes.values():
-        if upward and node.y >= threshold - 1e-6:
+        if upward and (
+            node.y > threshold + 1e-6
+            if same_row
+            else node.y >= threshold - 1e-6
+        ):
             node.y += gap
             node.task.row += 1
             moved = True
-        elif not upward and node.y <= threshold + 1e-6:
+        elif not upward and (
+            node.y < threshold - 1e-6
+            if same_row
+            else node.y <= threshold + 1e-6
+        ):
             node.y -= gap
             node.task.row -= 1
             moved = True
