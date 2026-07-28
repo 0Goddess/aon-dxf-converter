@@ -1,5 +1,5 @@
 {
-  "application_version": "2.0.4",
+  "application_version": "2.0.5",
   "source_mode_test": "passed",
   "windows_packaged_runtime_test": "pending GitHub Actions Windows build",
   "large_project_regression_test": "original schedule parsed: 553 tasks / 599 links; full DXF conversion intentionally not run",
@@ -14,6 +14,7 @@
     "blocked_route_dynamic_row_gap": "passed in adaptive retry logic; no fixed row limit per blocked relationship",
     "blocked_route_unbounded_alternation": "H1, V1, H2, V2, H3, V3 and onward; reroutes after every inserted gap",
     "same_row_blocked_route_vertical_gap": "chooses the less occupied side without moving source or target row",
+    "blocked_route_batch_analysis": "after H1 and V1, estimates a two-dimensional batch and probes 1x, 2x, 4x onward on disposable layout copies",
     "critical_path_centerline_priority": "preserved",
     "hierarchical_longest_chain_box_layout": "passed on provided 327-task / 328-link XML",
     "hierarchical_shared_empty_rows": "implemented with time-span collision checks",

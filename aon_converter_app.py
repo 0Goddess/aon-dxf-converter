@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import os
 import queue
@@ -24,7 +25,7 @@ from project_aon_ezdxf import EzdxfAonWriter, NODE_HEIGHT, X_SPACING, Y_SPACING,
 
 
 APP_NAME = "Project XML 轉 AON DXF"
-APP_VERSION = "2.0.4"
+APP_VERSION = "2.0.5"
 OUTPUT_SUFFIX = "_AON全區_AutoCAD2023.dxf"
 
 
@@ -180,6 +181,126 @@ def insert_route_row_gap(layout, link_index: int, gap: float = Y_SPACING) -> boo
     return True
 
 
+def estimate_route_gap_batch(layout, link_index: int) -> tuple[int, int]:
+    """Estimate a useful multi-column/multi-row expansion for one blocked link."""
+    link = next((item for item in layout.links if item.index == link_index), None)
+    if link is None:
+        return 2, 2
+    pred = layout.nodes[link.pred_uid]
+    succ = layout.nodes[link.succ_uid]
+    span_left = min(pred.x, succ.x) - X_SPACING * 0.25
+    span_right = max(pred.x, succ.x) + X_SPACING * 0.25
+    span_nodes = [
+        node
+        for uid, node in layout.nodes.items()
+        if uid not in {link.pred_uid, link.succ_uid}
+        and span_left <= node.x <= span_right
+    ]
+
+    if abs(succ.y - pred.y) < 1e-6:
+        row_y = pred.y
+        upper_rows = {
+            round(node.y / Y_SPACING)
+            for node in span_nodes
+            if node.y > row_y + 1e-6 and not node.task.critical
+        }
+        lower_rows = {
+            round(node.y / Y_SPACING)
+            for node in span_nodes
+            if node.y < row_y - 1e-6 and not node.task.critical
+        }
+        usable_counts = [len(rows) for rows in (upper_rows, lower_rows) if rows]
+        vertical = min(usable_counts) + 1 if usable_counts else 2
+    else:
+        low_y = min(pred.y, succ.y)
+        high_y = max(pred.y, succ.y)
+        occupied_rows = {
+            round(node.y / Y_SPACING)
+            for node in span_nodes
+            if low_y - Y_SPACING <= node.y <= high_y + Y_SPACING
+        }
+        vertical = len(occupied_rows) + 1
+
+    same_source_links = sum(
+        1 for item in layout.links if item.pred_uid == link.pred_uid
+    )
+    horizontal = 2 if same_source_links <= 3 else 3
+    return max(2, horizontal), max(2, vertical)
+
+
+def expanded_layout_copy(
+    layout,
+    link_index: int,
+    horizontal_count: int,
+    vertical_count: int,
+):
+    """Apply a batch expansion to a disposable layout copy."""
+    candidate = copy.deepcopy(layout)
+    horizontal_done = 0
+    vertical_done = 0
+    for _ in range(horizontal_count):
+        if not insert_route_column_gap(candidate, link_index):
+            break
+        horizontal_done += 1
+    for _ in range(vertical_count):
+        if not insert_route_row_gap(candidate, link_index):
+            break
+        vertical_done += 1
+    return candidate, horizontal_done, vertical_done
+
+
+def analyze_and_expand_route(
+    layout,
+    link_index: int,
+    update: Callable[[int, str], None],
+):
+    """Find a useful batch size by exponential probing on layout copies."""
+    seed_horizontal, seed_vertical = estimate_route_gap_batch(layout, link_index)
+    update(
+        43,
+        f"關係 {link_index} H1、V1 後仍無合法通道，分析工作框與通道占用…",
+    )
+    scale = 1
+    while True:
+        requested_horizontal = seed_horizontal * scale
+        requested_vertical = seed_vertical * scale
+        candidate, horizontal_done, vertical_done = expanded_layout_copy(
+            layout,
+            link_index,
+            requested_horizontal,
+            requested_vertical,
+        )
+        if horizontal_done == 0 and vertical_done == 0:
+            raise RuntimeError(
+                f"No clear final route for link {link_index}; "
+                "horizontal and vertical workbox spacing cannot be expanded"
+            )
+        update(
+            43,
+            f"關係 {link_index} 分析候選：水平 +{horizontal_done} 格、"
+            f"垂直 +{vertical_done} 格，驗證完整排線…",
+        )
+        try:
+            writer = EzdxfAonWriter(candidate)
+            return candidate, writer, horizontal_done, vertical_done, None
+        except RuntimeError as error:
+            match = re.fullmatch(r"No clear final route for link (\d+)", str(error))
+            if match is None:
+                raise
+            next_blocked_link = int(match.group(1))
+            if next_blocked_link != link_index:
+                # The original blockage is cleared. Keep this batch and let
+                # the outer loop analyze the newly exposed relationship.
+                return (
+                    candidate,
+                    None,
+                    horizontal_done,
+                    vertical_done,
+                    next_blocked_link,
+                )
+        scale *= 2
+
+
 def convert_project(
     xml_path: Path,
     output_directory: Path,
@@ -240,31 +361,62 @@ def convert_project(
                     raise
                 blocked_link = int(match.group(1))
                 attempts = route_gap_attempts.setdefault(
-                    blocked_link, {"horizontal": 0, "vertical": 0}
+                    blocked_link,
+                    {
+                        "horizontal": 0,
+                        "vertical": 0,
+                        "horizontal_probed": 0,
+                        "vertical_probed": 0,
+                    },
                 )
                 expanded = False
-                # Expand without a fixed attempt limit. Alternate dimensions
-                # for every blocked relationship:
-                # H1 -> V1 -> H2 -> V2 -> H3 -> V3 -> ...
-                horizontal_turn = attempts["horizontal"] <= attempts["vertical"]
-                dimensions = (
-                    (("horizontal", insert_route_column_gap), ("vertical", insert_route_row_gap))
-                    if horizontal_turn
-                    else (("vertical", insert_route_row_gap), ("horizontal", insert_route_column_gap))
-                )
-                for dimension, inserter in dimensions:
+                for dimension, inserter in (
+                    ("horizontal", insert_route_column_gap),
+                    ("vertical", insert_route_row_gap),
+                ):
+                    probe_key = f"{dimension}_probed"
+                    if attempts[probe_key]:
+                        continue
+                    attempts[probe_key] = 1
                     if not inserter(layout, blocked_link):
                         continue
                     attempts[dimension] += 1
-                    label = "水平空間不足，插入第 {} 格空白欄".format(
-                        attempts[dimension]
-                    ) if dimension == "horizontal" else "垂直通道不足，插入第 {} 格空白列".format(
-                        attempts[dimension]
+                    label = (
+                        "水平空間不足，插入 1 格空白欄"
+                        if dimension == "horizontal"
+                        else "垂直通道不足，插入 1 格空白列"
                     )
                     update(43, f"關係 {blocked_link} {label}後重新排線…")
                     expanded = True
                     break
                 if expanded:
+                    continue
+
+                if attempts["horizontal_probed"] and attempts["vertical_probed"]:
+                    (
+                        layout,
+                        analyzed_writer,
+                        added_horizontal,
+                        added_vertical,
+                        next_blocked_link,
+                    ) = analyze_and_expand_route(layout, blocked_link, update)
+                    attempts["horizontal"] += added_horizontal
+                    attempts["vertical"] += added_vertical
+                    if analyzed_writer is not None:
+                        update(
+                            43,
+                            f"關係 {blocked_link} 分析完成，一次套用水平 "
+                            f"+{added_horizontal} 格、垂直 +{added_vertical} 格；"
+                            "完整排線成功。",
+                        )
+                        writer = analyzed_writer
+                        break
+                    update(
+                        43,
+                        f"關係 {blocked_link} 已解除；一次套用水平 "
+                        f"+{added_horizontal} 格、垂直 +{added_vertical} 格，"
+                        f"接續分析關係 {next_blocked_link}…",
+                    )
                     continue
 
                 raise RuntimeError(
