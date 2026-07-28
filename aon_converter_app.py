@@ -21,11 +21,18 @@ import ezdxf
 
 from outline_dxf_unicode_text import convert as outline_unicode_text
 from project_aon_converter import build_layout, parse_project
-from project_aon_ezdxf import EzdxfAonWriter, NODE_HEIGHT, X_SPACING, Y_SPACING, enlarge_layout
+from project_aon_ezdxf import (
+    EzdxfAonWriter,
+    NODE_HEIGHT,
+    NODE_WIDTH,
+    X_SPACING,
+    Y_SPACING,
+    enlarge_layout,
+)
 
 
 APP_NAME = "Project XML 轉 AON DXF"
-APP_VERSION = "2.0.5"
+APP_VERSION = "2.0.6"
 OUTPUT_SUFFIX = "_AON全區_AutoCAD2023.dxf"
 
 
@@ -254,16 +261,22 @@ def analyze_and_expand_route(
     link_index: int,
     update: Callable[[int, str], None],
 ):
-    """Find a useful batch size by exponential probing on layout copies."""
+    """Test a bounded set of geometry-based batches on disposable copies."""
     seed_horizontal, seed_vertical = estimate_route_gap_batch(layout, link_index)
     update(
         43,
         f"關係 {link_index} H1、V1 後仍無合法通道，分析工作框與通道占用…",
     )
-    scale = 1
-    while True:
-        requested_horizontal = seed_horizontal * scale
-        requested_vertical = seed_vertical * scale
+    candidates = (
+        (seed_horizontal, seed_vertical),
+        (seed_horizontal, 0),
+        (0, seed_vertical),
+    )
+    tested: set[tuple[int, int]] = set()
+    for requested_horizontal, requested_vertical in candidates:
+        if (requested_horizontal, requested_vertical) in tested:
+            continue
+        tested.add((requested_horizontal, requested_vertical))
         candidate, horizontal_done, vertical_done = expanded_layout_copy(
             layout,
             link_index,
@@ -271,10 +284,7 @@ def analyze_and_expand_route(
             requested_vertical,
         )
         if horizontal_done == 0 and vertical_done == 0:
-            raise RuntimeError(
-                f"No clear final route for link {link_index}; "
-                "horizontal and vertical workbox spacing cannot be expanded"
-            )
+            continue
         update(
             43,
             f"關係 {link_index} 分析候選：水平 +{horizontal_done} 格、"
@@ -298,7 +308,93 @@ def analyze_and_expand_route(
                     vertical_done,
                     next_blocked_link,
                 )
-        scale *= 2
+    return layout, None, 0, 0, link_index
+
+
+def relocate_blocked_branch(layout, link_index: int) -> tuple[bool, int]:
+    """Move one non-critical branch directly to its nearest collision-free row."""
+    link = next((item for item in layout.links if item.index == link_index), None)
+    if link is None:
+        return False, 0
+
+    successors: dict[str, list[str]] = {}
+    predecessors: dict[str, list[str]] = {}
+    for item in layout.links:
+        successors.setdefault(item.pred_uid, []).append(item.succ_uid)
+        predecessors.setdefault(item.succ_uid, []).append(item.pred_uid)
+
+    if not layout.nodes[link.succ_uid].task.critical:
+        anchor_uid = link.succ_uid
+        graph = successors
+    elif not layout.nodes[link.pred_uid].task.critical:
+        anchor_uid = link.pred_uid
+        graph = predecessors
+    else:
+        return False, 0
+
+    component: set[str] = set()
+    stack = [anchor_uid]
+    while stack:
+        uid = stack.pop()
+        if uid in component or layout.nodes[uid].task.critical:
+            continue
+        component.add(uid)
+        stack.extend(graph.get(uid, ()))
+    if not component:
+        return False, 0
+
+    anchor = layout.nodes[anchor_uid]
+    if anchor.y > 1e-6:
+        directions = (1, -1)
+    elif anchor.y < -1e-6:
+        directions = (-1, 1)
+    else:
+        upper_count = sum(node.y > 1e-6 for node in layout.nodes.values())
+        lower_count = sum(node.y < -1e-6 for node in layout.nodes.values())
+        directions = (1, -1) if upper_count <= lower_count else (-1, 1)
+
+    fixed = [
+        node for uid, node in layout.nodes.items() if uid not in component
+    ]
+    occupied_rows = {node.task.row for node in layout.nodes.values()}
+    max_steps = max(2, len(occupied_rows) + 1)
+
+    for direction in directions:
+        for steps in range(1, max_steps + 1):
+            delta_y = direction * steps * Y_SPACING
+            collision = False
+            for uid in component:
+                moved = layout.nodes[uid]
+                new_y = moved.y + delta_y
+                if any(
+                    abs(moved.x - other.x) < NODE_WIDTH - 1e-6
+                    and abs(new_y - other.y) < NODE_HEIGHT + 1e-6
+                    for other in fixed
+                ):
+                    collision = True
+                    break
+            if collision:
+                continue
+            for uid in component:
+                node = layout.nodes[uid]
+                node.y += delta_y
+                node.task.row += direction * steps
+            layout.lane_ranges = {}
+            layout.min_y = (
+                min(node.y for node in layout.nodes.values()) - NODE_HEIGHT - 110.0
+            )
+            layout.max_y = max(node.y for node in layout.nodes.values()) + 250.0
+            layout.height = layout.max_y - layout.min_y
+            stats = getattr(layout, "optimization_stats", None)
+            if isinstance(stats, dict):
+                stats["route_branch_relocations"] = (
+                    stats.get("route_branch_relocations", 0) + 1
+                )
+                stats.setdefault("route_branch_relocation_links", []).append(
+                    link_index
+                )
+            return True, direction * steps
+    return False, 0
 
 
 def convert_project(
@@ -367,6 +463,7 @@ def convert_project(
                         "vertical": 0,
                         "horizontal_probed": 0,
                         "vertical_probed": 0,
+                        "relayout_probed": 0,
                     },
                 )
                 expanded = False
@@ -393,6 +490,11 @@ def convert_project(
                     continue
 
                 if attempts["horizontal_probed"] and attempts["vertical_probed"]:
+                    if attempts["relayout_probed"]:
+                        raise RuntimeError(
+                            f"No clear final route for link {blocked_link}; "
+                            "bounded spacing analysis and local branch relocation failed"
+                        )
                     (
                         layout,
                         analyzed_writer,
@@ -411,6 +513,24 @@ def convert_project(
                         )
                         writer = analyzed_writer
                         break
+                    if next_blocked_link == blocked_link:
+                        if not attempts["relayout_probed"]:
+                            attempts["relayout_probed"] = 1
+                            relocated, row_delta = relocate_blocked_branch(
+                                layout, blocked_link
+                            )
+                            if relocated:
+                                update(
+                                    43,
+                                    f"關係 {blocked_link} 有限擴格仍無解，"
+                                    f"判定為局部排版問題；將所屬非要徑分支"
+                                    f"直接移動 {abs(row_delta)} 列後重新排線…",
+                                )
+                                continue
+                        raise RuntimeError(
+                            f"No clear final route for link {blocked_link}; "
+                            "bounded spacing analysis and local branch relocation failed"
+                        )
                     update(
                         43,
                         f"關係 {blocked_link} 已解除；一次套用水平 "
