@@ -32,7 +32,7 @@ from project_aon_ezdxf import (
 
 
 APP_NAME = "Project XML 轉 AON DXF"
-APP_VERSION = "2.0.6"
+APP_VERSION = "2.0.7"
 OUTPUT_SUFFIX = "_AON全區_AutoCAD2023.dxf"
 
 

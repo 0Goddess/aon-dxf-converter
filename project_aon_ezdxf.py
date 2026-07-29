@@ -2874,7 +2874,7 @@ class EzdxfAonWriter:
                     if respects_endpoint_stubs(candidate) and not path_hits_node(link, candidate) and not overlaps_accepted(candidate) and not crosses_same_source(link, candidate) and keeps_source_fan(candidate) and path_y_reversals(candidate) == 0:
                         chosen = candidate
                         break
-                if chosen is None:
+                if chosen is None and not source_fan_is_locked(link):
                     # Dense long links may not have the preferred full channel
                     # spacing.  Relax spacing only, never node clearance or
                     # physical line separation, and keep the route on the
@@ -2902,7 +2902,7 @@ class EzdxfAonWriter:
                         if respects_endpoint_stubs(candidate) and not path_hits_node(link, candidate) and not touches_accepted(candidate) and not crosses_same_source(link, candidate) and keeps_source_fan(candidate) and path_y_reversals(candidate) == 0:
                             chosen = candidate
                             break
-                if chosen is None:
+                if chosen is None and not source_fan_is_locked(link):
                     # Source and target corridors can require different x
                     # offsets.  Search them independently as the final
                     # node-clear fallback instead of sending the line to the
@@ -2999,35 +2999,72 @@ class EzdxfAonWriter:
                                 chosen_mode = "locked_fan_relaxed_order"
                                 locked_fan_relaxation_links += 1
                                 break
-                if chosen is None and not source_fan_is_locked(link):
-                    # Absolute safety fallback for pathological congestion:
-                    # search independent source/target trunks.  This may
-                    # relax the fan bend order, but never the geometric hard
-                    # rules, and is preferable to failing the whole export.
+                if chosen is None:
+                    # Absolute safety fallback for pathological congestion.
+                    #
+                    # V2.0.6 accidentally disabled this fallback whenever a
+                    # source had two or more successors.  A locked fan could
+                    # therefore have plenty of free outer space and still
+                    # abort after the bounded spacing analysis (link 541 is a
+                    # reproducible example).  Keep the source port height and
+                    # the hard no-cross/no-touch rules, but allow the final
+                    # vertical trunk to move away from its preferred bend.
                     side = -1 if arrow_base[1] <= start[1] else 1
                     local_edge = (
                         min(start[1], arrow_base[1]) - NODE_HEIGHT
                         if side < 0
                         else max(start[1], arrow_base[1])
                     )
-                    for attempt in range(1, 2001):
-                        outside_y = local_edge + side * (21.0 + attempt * 4.73)
-                        source_x = start[0] + source_shift * (31.0 + attempt * 5.11)
-                        target_x = arrow_base[0] + target_shift * (31.0 + attempt * 5.29)
-                        candidate = simplify_points(
-                            [
-                                start,
-                                (source_x, start[1]),
-                                (source_x, outside_y),
-                                (target_x, outside_y),
-                                (target_x, arrow_base[1]),
-                                arrow_base,
-                            ]
+                    locked_x = first_vertical_x(points)
+                    # Couple X and Y growth into one deterministic sequence.
+                    # The previous Cartesian 400×240 probe avoided failure but
+                    # could hold a dense export at 43% for many minutes.
+                    for attempt in range(1, 601):
+                        outside_y = local_edge + side * (
+                            21.0 + attempt * 4.73
                         )
+                        source_x = start[0] + source_shift * (
+                            31.0 + attempt * 5.11
+                        )
+                        target_x = arrow_base[0] + target_shift * (
+                            31.0 + attempt * 5.29
+                        )
+                        if source_fan_is_locked(link) and locked_x is not None:
+                            # Preserve the assigned first fan bend, then use
+                            # one short ordered escape lane before the outer
+                            # trunk.  The lane grows more slowly than the
+                            # outside corridor so it never reverses vertically.
+                            source_lane_y = start[1] + side * (
+                                9.0 + attempt * 2.17
+                            )
+                            candidate = simplify_points(
+                                [
+                                    start,
+                                    (locked_x, start[1]),
+                                    (locked_x, source_lane_y),
+                                    (source_x, source_lane_y),
+                                    (source_x, outside_y),
+                                    (target_x, outside_y),
+                                    (target_x, arrow_base[1]),
+                                    arrow_base,
+                                ]
+                            )
+                        else:
+                            candidate = simplify_points(
+                                [
+                                    start,
+                                    (source_x, start[1]),
+                                    (source_x, outside_y),
+                                    (target_x, outside_y),
+                                    (target_x, arrow_base[1]),
+                                    arrow_base,
+                                ]
+                            )
                         if (
                             respects_endpoint_stubs(candidate)
                             and not path_hits_node(link, candidate)
                             and not touches_accepted(candidate)
+                            and not crosses_same_source(link, candidate)
                         ):
                             chosen = candidate
                             chosen_mode = "hard_clearance_fallback"

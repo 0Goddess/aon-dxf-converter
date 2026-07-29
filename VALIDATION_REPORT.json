@@ -1,8 +1,8 @@
 {
-  "application_version": "2.0.6",
+  "application_version": "2.0.7",
   "source_mode_test": "passed",
   "windows_packaged_runtime_test": "pending GitHub Actions Windows build",
-  "large_project_regression_test": "original schedule parsed: 553 tasks / 599 links; full DXF conversion intentionally not run",
+  "large_project_regression_test": "original schedule parsed: 553 tasks / 599 links; full route-only validation was stopped after the existing full-graph collision pass exceeded the agreed practical wait; no DXF conversion was run",
   "synthetic_geometry_result": {
     "python_syntax": "passed",
     "orthogonal_segments": "passed",
@@ -17,6 +17,9 @@
     "blocked_route_batch_analysis": "after H1 and V1, tests only the geometry-estimated combined, horizontal-only, and vertical-only batches",
     "blocked_route_unbounded_growth_guard": "removed exponential growth; no candidate can exceed measured obstruction rows or columns",
     "blocked_route_local_branch_relayout": "moves the affected non-critical branch directly to the nearest collision-free row when bounded spacing cannot solve the same link",
+    "locked_fan_final_fallback": "enabled for multi-successor locked fans; preserves assigned first bend and hard node/line clearance while moving only the outer trunk",
+    "locked_fan_impossible_search_guard": "skips two generic candidate loops that can never satisfy a locked first-bend constraint",
+    "outer_fallback_vertical_return": "permits the single necessary return from an outside corridor to the target; all node, endpoint-stub, no-touch and same-source no-cross rules remain hard",
     "critical_path_centerline_priority": "preserved",
     "hierarchical_longest_chain_box_layout": "passed on provided 327-task / 328-link XML",
     "hierarchical_shared_empty_rows": "implemented with time-span collision checks",
@@ -77,6 +80,7 @@
   ],
   "notes": [
     "The original regression input was parsed successfully as 553 tasks and 599 links; no DXF was emitted.",
+    "Python syntax validation passed. The full route-only large-project run was intentionally stopped after exceeding the practical wait time and is not claimed as passed.",
     "The included workflow builds and packages the Windows x64 executable on GitHub Actions."
   ]
 }
