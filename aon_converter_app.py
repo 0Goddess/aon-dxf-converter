@@ -32,7 +32,7 @@ from project_aon_ezdxf import (
 
 
 APP_NAME = "Project XML 轉 AON DXF"
-APP_VERSION = "2.0.7"
+APP_VERSION = "2.0.8"
 OUTPUT_SUFFIX = "_AON全區_AutoCAD2023.dxf"
 
 
@@ -312,7 +312,14 @@ def analyze_and_expand_route(
 
 
 def relocate_blocked_branch(layout, link_index: int) -> tuple[bool, int]:
-    """Move one non-critical branch directly to its nearest collision-free row."""
+    """Move a blocked non-critical branch to the best open row in one pass.
+
+    V2.0.7 stopped after testing only the nearest collision-free row.  That row
+    can still leave the relationship's vertical corridor inside the same dense
+    fan.  Evaluate all bounded, collision-free rows first and prefer the row
+    with the fewest workboxes in the relationship corridor; distance is only a
+    tie breaker.  Critical tasks are never part of the movable component.
+    """
     link = next((item for item in layout.links if item.index == link_index), None)
     if link is None:
         return False, 0
@@ -359,7 +366,8 @@ def relocate_blocked_branch(layout, link_index: int) -> tuple[bool, int]:
     occupied_rows = {node.task.row for node in layout.nodes.values()}
     max_steps = max(2, len(occupied_rows) + 1)
 
-    for direction in directions:
+    candidates: list[tuple[tuple[int, int, int], int, int]] = []
+    for direction_rank, direction in enumerate(directions):
         for steps in range(1, max_steps + 1):
             delta_y = direction * steps * Y_SPACING
             collision = False
@@ -375,26 +383,48 @@ def relocate_blocked_branch(layout, link_index: int) -> tuple[bool, int]:
                     break
             if collision:
                 continue
-            for uid in component:
-                node = layout.nodes[uid]
-                node.y += delta_y
-                node.task.row += direction * steps
-            layout.lane_ranges = {}
-            layout.min_y = (
-                min(node.y for node in layout.nodes.values()) - NODE_HEIGHT - 110.0
+
+            pred = layout.nodes[link.pred_uid]
+            succ = layout.nodes[link.succ_uid]
+            pred_y = pred.y + (delta_y if link.pred_uid in component else 0.0)
+            succ_y = succ.y + (delta_y if link.succ_uid in component else 0.0)
+            left = min(pred.x, succ.x) - NODE_WIDTH * 0.15
+            right = max(pred.x, succ.x) + NODE_WIDTH * 0.15
+            low = min(pred_y, succ_y) - NODE_HEIGHT * 0.35
+            high = max(pred_y, succ_y) + NODE_HEIGHT * 0.35
+            corridor_blockers = sum(
+                1
+                for other in fixed
+                if left < other.x + NODE_WIDTH / 2.0
+                and right > other.x - NODE_WIDTH / 2.0
+                and low < other.y + NODE_HEIGHT / 2.0
+                and high > other.y - NODE_HEIGHT / 2.0
             )
-            layout.max_y = max(node.y for node in layout.nodes.values()) + 250.0
-            layout.height = layout.max_y - layout.min_y
-            stats = getattr(layout, "optimization_stats", None)
-            if isinstance(stats, dict):
-                stats["route_branch_relocations"] = (
-                    stats.get("route_branch_relocations", 0) + 1
-                )
-                stats.setdefault("route_branch_relocation_links", []).append(
-                    link_index
-                )
-            return True, direction * steps
-    return False, 0
+            # Prefer a genuinely open corridor, then the smallest move.  The
+            # original side preference is retained only as the final tie.
+            candidates.append(
+                ((corridor_blockers, steps, direction_rank), direction, steps)
+            )
+
+    if not candidates:
+        return False, 0
+    _, direction, steps = min(candidates, key=lambda item: item[0])
+    delta_y = direction * steps * Y_SPACING
+    for uid in component:
+        node = layout.nodes[uid]
+        node.y += delta_y
+        node.task.row += direction * steps
+    layout.lane_ranges = {}
+    layout.min_y = min(node.y for node in layout.nodes.values()) - NODE_HEIGHT - 110.0
+    layout.max_y = max(node.y for node in layout.nodes.values()) + 250.0
+    layout.height = layout.max_y - layout.min_y
+    stats = getattr(layout, "optimization_stats", None)
+    if isinstance(stats, dict):
+        stats["route_branch_relocations"] = (
+            stats.get("route_branch_relocations", 0) + 1
+        )
+        stats.setdefault("route_branch_relocation_links", []).append(link_index)
+    return True, direction * steps
 
 
 def convert_project(
@@ -463,7 +493,7 @@ def convert_project(
                         "vertical": 0,
                         "horizontal_probed": 0,
                         "vertical_probed": 0,
-                        "relayout_probed": 0,
+                        "relayout_attempts": 0,
                     },
                 )
                 expanded = False
@@ -490,7 +520,7 @@ def convert_project(
                     continue
 
                 if attempts["horizontal_probed"] and attempts["vertical_probed"]:
-                    if attempts["relayout_probed"]:
+                    if attempts["relayout_attempts"] >= 6:
                         raise RuntimeError(
                             f"No clear final route for link {blocked_link}; "
                             "bounded spacing analysis and local branch relocation failed"
@@ -514,8 +544,8 @@ def convert_project(
                         writer = analyzed_writer
                         break
                     if next_blocked_link == blocked_link:
-                        if not attempts["relayout_probed"]:
-                            attempts["relayout_probed"] = 1
+                        if attempts["relayout_attempts"] < 6:
+                            attempts["relayout_attempts"] += 1
                             relocated, row_delta = relocate_blocked_branch(
                                 layout, blocked_link
                             )
@@ -524,7 +554,8 @@ def convert_project(
                                     43,
                                     f"關係 {blocked_link} 有限擴格仍無解，"
                                     f"判定為局部排版問題；將所屬非要徑分支"
-                                    f"直接移動 {abs(row_delta)} 列後重新排線…",
+                                    f"一次選擇較開放通道並移動 {abs(row_delta)} 列"
+                                    f"（候選 {attempts['relayout_attempts']}/6）後重新排線…",
                                 )
                                 continue
                         raise RuntimeError(
