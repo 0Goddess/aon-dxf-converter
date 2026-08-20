@@ -3070,6 +3070,92 @@ class EzdxfAonWriter:
                             chosen_mode = "hard_clearance_fallback"
                             locked_fan_relaxation_links += 1
                             break
+                if chosen is None:
+                    # A same-row SS/FF relationship between two critical
+                    # tasks cannot be repaired by moving either endpoint or
+                    # its branch.  Link 541 in the large regression schedule
+                    # is such a relationship.  Search a small, deterministic
+                    # set of drawing-exterior lanes with independent source
+                    # and target trunks instead of asking the layout layer to
+                    # move critical workboxes.  All physical clearance rules
+                    # remain hard; only the otherwise impossible same-row
+                    # vertical return is accepted as a necessary detour.
+                    locked_x = first_vertical_x(points)
+                    locked = source_fan_is_locked(link) and locked_x is not None
+                    exterior_candidates: list[float] = []
+                    for lane in range(1, 13):
+                        offset = 90.0 + lane * PREFERRED_HORIZONTAL_CHANNEL_SPACING
+                        exterior_candidates.extend(
+                            (node_top + offset, node_bottom - offset)
+                        )
+                    source_x_candidates = [
+                        start[0]
+                        + source_shift
+                        * (
+                            MIN_ENDPOINT_STUB_LENGTH
+                            + step * MIN_VERTICAL_CHANNEL_SPACING
+                        )
+                        for step in range(1, 17)
+                    ]
+                    target_x_candidates = [
+                        arrow_base[0]
+                        + target_shift
+                        * (
+                            MIN_ENDPOINT_STUB_LENGTH
+                            + step * MIN_VERTICAL_CHANNEL_SPACING
+                        )
+                        for step in range(1, 17)
+                    ]
+                    for outside_y in exterior_candidates:
+                        side = 1 if outside_y > start[1] else -1
+                        for source_x in source_x_candidates:
+                            for target_x in target_x_candidates:
+                                if locked:
+                                    source_lane_y = start[1] + side * (
+                                        12.0
+                                        + (
+                                            abs(source_x - start[0])
+                                            / MIN_VERTICAL_CHANNEL_SPACING
+                                        )
+                                        * 2.0
+                                    )
+                                    candidate = simplify_points(
+                                        [
+                                            start,
+                                            (locked_x, start[1]),
+                                            (locked_x, source_lane_y),
+                                            (source_x, source_lane_y),
+                                            (source_x, outside_y),
+                                            (target_x, outside_y),
+                                            (target_x, arrow_base[1]),
+                                            arrow_base,
+                                        ]
+                                    )
+                                else:
+                                    candidate = simplify_points(
+                                        [
+                                            start,
+                                            (source_x, start[1]),
+                                            (source_x, outside_y),
+                                            (target_x, outside_y),
+                                            (target_x, arrow_base[1]),
+                                            arrow_base,
+                                        ]
+                                    )
+                                if (
+                                    respects_endpoint_stubs(candidate)
+                                    and not path_hits_node(link, candidate)
+                                    and not touches_accepted(candidate)
+                                    and not crosses_same_source(link, candidate)
+                                    and keeps_source_fan(candidate)
+                                ):
+                                    chosen = candidate
+                                    chosen_mode = "critical_same_row_exterior"
+                                    break
+                            if chosen is not None:
+                                break
+                        if chosen is not None:
+                            break
                 if chosen is not None:
                     shortened = remove_unnecessary_detours(link, chosen)
                     if respects_endpoint_stubs(shortened) and not path_hits_node(link, shortened) and not overlaps_accepted(shortened) and keeps_source_fan(shortened) and path_y_reversals(shortened) <= path_y_reversals(chosen):

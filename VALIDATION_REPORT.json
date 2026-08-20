@@ -1,5 +1,5 @@
 {
-  "application_version": "2.0.8",
+  "application_version": "2.0.9",
   "source_mode_test": "passed",
   "windows_packaged_runtime_test": "pending GitHub Actions Windows build",
   "large_project_regression_test": "original schedule parsed: 553 tasks / 599 links; full route-only validation was stopped after the existing full-graph collision pass exceeded the agreed practical wait; no DXF conversion was run",
@@ -17,6 +17,7 @@
     "blocked_route_batch_analysis": "after H1 and V1, tests only the geometry-estimated combined, horizontal-only, and vertical-only batches",
     "blocked_route_unbounded_growth_guard": "removed exponential growth; no candidate can exceed measured obstruction rows or columns",
     "blocked_route_local_branch_relayout": "evaluates all bounded collision-free rows, prefers the row with the fewest workboxes in the blocked relationship corridor, and permits up to six finite local re-evaluations without moving critical tasks",
+    "critical_same_row_exterior_route": "same-row SS/FF links with critical endpoints keep both workboxes fixed and independently search bounded source/target trunks on drawing-exterior lanes while preserving all hard clearances",
     "locked_fan_final_fallback": "enabled for multi-successor locked fans; preserves assigned first bend and hard node/line clearance while moving only the outer trunk",
     "locked_fan_impossible_search_guard": "skips two generic candidate loops that can never satisfy a locked first-bend constraint",
     "outer_fallback_vertical_return": "permits the single necessary return from an outside corridor to the target; all node, endpoint-stub, no-touch and same-source no-cross rules remain hard",
