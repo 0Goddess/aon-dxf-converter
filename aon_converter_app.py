@@ -32,7 +32,7 @@ from project_aon_ezdxf import (
 
 
 APP_NAME = "Project XML 轉 AON DXF"
-APP_VERSION = "2.0.9"
+APP_VERSION = "2.0.10"
 OUTPUT_SUFFIX = "_AON全區_AutoCAD2023.dxf"
 
 
@@ -294,7 +294,7 @@ def analyze_and_expand_route(
             writer = EzdxfAonWriter(candidate)
             return candidate, writer, horizontal_done, vertical_done, None
         except RuntimeError as error:
-            match = re.fullmatch(r"No clear final route for link (\d+)", str(error))
+            match = re.match(r"No clear final route for link (\d+)", str(error))
             if match is None:
                 raise
             next_blocked_link = int(match.group(1))
@@ -482,7 +482,7 @@ def convert_project(
                 writer = EzdxfAonWriter(layout)
                 break
             except RuntimeError as error:
-                match = re.fullmatch(r"No clear final route for link (\d+)", str(error))
+                match = re.match(r"No clear final route for link (\d+)", str(error))
                 if match is None:
                     raise
                 blocked_link = int(match.group(1))

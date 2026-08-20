@@ -2662,6 +2662,26 @@ class EzdxfAonWriter:
             geometry_by_link,
             key=lambda index: (
                 0 if bool(geometry_by_link[index].get("direct")) else 1,
+                # Same-row SS/FF links between critical tasks have fixed
+                # endpoints and cannot be repaired by moving either branch.
+                # Give these constrained relationships first claim on a
+                # legal lane; flexible long routes can move around them.
+                0
+                if (
+                    link_by_index[index].relation in ("SS", "FF")
+                    and self.layout.nodes[
+                        link_by_index[index].pred_uid
+                    ].task.critical
+                    and self.layout.nodes[
+                        link_by_index[index].succ_uid
+                    ].task.critical
+                    and math.isclose(
+                        self.layout.nodes[link_by_index[index].pred_uid].y,
+                        self.layout.nodes[link_by_index[index].succ_uid].y,
+                        abs_tol=1e-6,
+                    )
+                )
+                else 1,
                 0
                 if (
                     self.layout.nodes[link_by_index[index].pred_uid].task.critical
@@ -2700,6 +2720,7 @@ class EzdxfAonWriter:
                 target_shift = -int(geometry["arrow_direction"])
                 chosen = None
                 chosen_mode = ""
+                final_diagnostics = ""
 
                 def keeps_source_fan(candidate: list[tuple[float, float]]) -> bool:
                     return preserves_locked_source_bend(link, candidate, points)
@@ -3106,6 +3127,13 @@ class EzdxfAonWriter:
                         )
                         for step in range(1, 17)
                     ]
+                    rejection_counts = {
+                        "stub": 0,
+                        "node": 0,
+                        "touch": 0,
+                        "fan_cross": 0,
+                        "fan_bend": 0,
+                    }
                     for outside_y in exterior_candidates:
                         side = 1 if outside_y > start[1] else -1
                         for source_x in source_x_candidates:
@@ -3142,13 +3170,22 @@ class EzdxfAonWriter:
                                             arrow_base,
                                         ]
                                     )
-                                if (
-                                    respects_endpoint_stubs(candidate)
-                                    and not path_hits_node(link, candidate)
-                                    and not touches_accepted(candidate)
-                                    and not crosses_same_source(link, candidate)
-                                    and keeps_source_fan(candidate)
-                                ):
+                                stub_ok = respects_endpoint_stubs(candidate)
+                                node_hit = path_hits_node(link, candidate)
+                                touching = touches_accepted(candidate)
+                                fan_cross = crosses_same_source(link, candidate)
+                                fan_bend_ok = keeps_source_fan(candidate)
+                                if not stub_ok:
+                                    rejection_counts["stub"] += 1
+                                elif node_hit:
+                                    rejection_counts["node"] += 1
+                                elif touching:
+                                    rejection_counts["touch"] += 1
+                                elif fan_cross:
+                                    rejection_counts["fan_cross"] += 1
+                                elif not fan_bend_ok:
+                                    rejection_counts["fan_bend"] += 1
+                                else:
                                     chosen = candidate
                                     chosen_mode = "critical_same_row_exterior"
                                     break
@@ -3156,6 +3193,11 @@ class EzdxfAonWriter:
                                 break
                         if chosen is not None:
                             break
+                    if chosen is None:
+                        final_diagnostics = "; exterior=" + ",".join(
+                            f"{name}:{count}"
+                            for name, count in rejection_counts.items()
+                        )
                 if chosen is not None:
                     shortened = remove_unnecessary_detours(link, chosen)
                     if respects_endpoint_stubs(shortened) and not path_hits_node(link, shortened) and not overlaps_accepted(shortened) and keeps_source_fan(shortened) and path_y_reversals(shortened) <= path_y_reversals(chosen):
@@ -3168,7 +3210,10 @@ class EzdxfAonWriter:
                     if hits_node:
                         node_avoidance_links += 1
                 else:
-                    raise RuntimeError(f"No clear final route for link {link.index}")
+                    raise RuntimeError(
+                        f"No clear final route for link {link.index}"
+                        f"{final_diagnostics}"
+                    )
             segments = orthogonal_segments(points)
             accepted_segments.extend(segments[1:-1] if len(segments) > 2 else segments)
             accepted_all_segments.extend(segments)
